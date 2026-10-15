@@ -47,6 +47,56 @@ Run the tests with:
 .venv/bin/python -m unittest test_analisis_tiro -v
 ```
 
+## Web Platform (Backend API + Frontend Web)
+
+The repository includes a web platform allowing users to inspect historical runs or upload MP4 videos directly through a graphical interface, configuring dominant side (`--side`) and visual feedback overlay (`--feedback`) via UI controls instead of terminal arguments.
+
+### Prerequisites
+
+1. **Backend dependencies:**
+   ```bash
+   python3.11 -m venv .venv
+   .venv/bin/pip install -r requirements.txt
+   .venv/bin/pip install -r requirements-api.txt
+   ```
+   *System requirement:* `ffmpeg` and `ffprobe` must be present on PATH (used for in-RAM decoding and encoding without writing temporary video files to disk).
+
+2. **Frontend dependencies:**
+   ```bash
+   npm install
+   ```
+
+### Running the Platform
+
+From the repository root, start both services in separate terminals:
+
+- **Terminal 1 — Backend API (Flask on port 5001):**
+  ```bash
+  npm run dev:api
+  ```
+  *(Runs `packages/api/app.py` bound to port 5001. Override results directory with `ANALISIS_RESULTS_DIR` if needed).*
+
+- **Terminal 2 — Frontend (Vite on port 5173):**
+  ```bash
+  npm run dev:web
+  ```
+  *(Runs `packages/web` with Vite dev server. The proxy automatically routes `/api/*` requests to `http://127.0.0.1:5001`).*
+
+Open **http://localhost:5173** in your web browser.
+
+### Running Tests & Build
+
+```bash
+# Core analysis tests (Python)
+npm run test:analisis
+
+# API tests (Python)
+npm run test:api
+
+# Frontend build & typecheck (TypeScript + Vite)
+npm run build:web
+```
+
 ## Known limitations
 
 - 2D sagittal-plane approximation: angles are computed on image-plane (pixel)

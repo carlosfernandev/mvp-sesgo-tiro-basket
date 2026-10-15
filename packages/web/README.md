@@ -1,23 +1,26 @@
 # packages/web — visor de análisis de tiro
 
 Single-page React + TypeScript app (Vite, React 18, Recharts) that visualizes
-the shot-analysis sessions served by `packages/api/app.py`. It never talks to
-the analysis pipeline directly — only to the read-only Flask API.
+shot-analysis sessions and allows uploading and analyzing shooting videos
+in-memory via `packages/api/app.py`.
 
 ## Desarrollo
 
 ```bash
 # Terminal 1 — API (from the repo root):
-ANALISIS_RESULTS_DIR=outputs .venv/bin/python -m flask \
-  --app packages/api/app.py run --port 5097
+npm run dev:api
+# Or directly with Python:
+ANALISIS_RESULTS_DIR=outputs .venv/bin/python packages/api/app.py
 
-# Terminal 2 — frontend (from packages/web):
-npm install
-npm run dev     # http://localhost:5173, /api/* proxied to :5097
+# Terminal 2 — Frontend (from the repo root):
+npm run dev:web
+# Or from packages/web:
+cd packages/web && npm run dev
 ```
 
+The frontend runs on `http://localhost:5173`.
 The Vite dev proxy (`vite.config.ts`) forwards same-origin `/api/*` calls to
-`http://127.0.0.1:5097` by default; set `API_PORT` to point elsewhere. No
+`http://127.0.0.1:5001` by default; set `API_PORT` to point elsewhere. No
 component hardcodes a host or port — see `src/api.ts`.
 
 ## Estructura

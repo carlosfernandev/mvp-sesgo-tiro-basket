@@ -5,6 +5,9 @@
   "workspaces": ["packages/*"],
   "scripts": {
     "dev:api": "npm run dev --workspace packages/api",
-    "test:analisis": ".venv/bin/python -m unittest test_analisis_tiro"
+    "dev:web": "npm run dev --workspace packages/web",
+    "build:web": "npm run build --workspace packages/web",
+    "test:analisis": ".venv/bin/python -m unittest test_analisis_tiro",
+    "test:api": ".venv/bin/python -m unittest packages/api/test_app.py"
   }
 }
