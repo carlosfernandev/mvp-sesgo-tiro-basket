@@ -1,5 +1,8 @@
 /.venv
 /__pycache__
+__pycache__/
+node_modules/
+dist/
 /angles_video3.csv
 /angulos_tiro.csv
 /feedback.mp4
