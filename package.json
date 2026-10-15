@@ -1,0 +1,10 @@
+{
+  "private": true,
+  "name": "mvp-sesgo-tiro-basket",
+  "version": "0.1.0",
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "dev:api": "npm run dev --workspace packages/api",
+    "test:analisis": ".venv/bin/python -m unittest test_analisis_tiro"
+  }
+}

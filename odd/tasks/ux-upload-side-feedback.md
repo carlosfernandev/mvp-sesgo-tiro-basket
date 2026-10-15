@@ -31,8 +31,8 @@ Reemplazar el flujo manual de consola por una experiencia de usuario (UX) integr
 
 - [x] **T1 — Ajuste de puerto proxy en Vite.** Modificar `packages/web/vite.config.ts` para usar 5001 por defecto. (Completado: default proxy target actualizado a 5001 y verificado con `npm run build`).
 - [x] **T2 — Soporte de `side` y `feedback` en `packages/api/app.py` con tests.** Aceptar y validar query params en `POST /api/analizar`, renderizado condicional de feedback, retorno de lado elegido y tests de API. (Completado: implementado en `packages/api/app.py`, 13 tests en `packages/api/test_app.py` y 71 tests existentes en verde).
-- [ ] **T3 — Tipos y cliente API en frontend (`types.ts`, `api.ts`).** Agregar `DominantSide` y opciones en `uploadVideo`.
-- [ ] **T4 — Rediseño de UX en `UploadPanel.tsx` y estilos en `styles.css`.** Estadificación de archivo, selector de lado, toggle de feedback y botón de ejecución con feedback visual.
+- [x] **T3 — Tipos y cliente API en frontend (`types.ts`, `api.ts`).** Agregar `DominantSide` y opciones en `uploadVideo`. (Completado: tipos `DominantSide`, `UploadOptions` y `AnalyzeResult.video_url: string | null` exportados en `types.ts`; `uploadVideo` en `api.ts` actualizado con sobrecargas compatibles y serialización de query params `side` y `feedback`).
+- [x] **T4 — Rediseño de UX en `UploadPanel.tsx` y estilos en `styles.css`.** Estadificación de archivo, selector de lado, toggle de feedback y botón de ejecución con feedback visual. (Completado: estadificación de archivo mediante `selectedFile`, selector ergonómico de 3 opciones de lado dominante, toggle de video de feedback biomecánico por defecto activo, botón explícito de acción, barras de progreso y estilos accesibles en `styles.css`).
 - [ ] **T5 — Verificación integral.** Ejecutar suite de tests backend (`pytest` / `unittest`) y build frontend (`npm run build`).
 
 ## Criterios de Aceptación
