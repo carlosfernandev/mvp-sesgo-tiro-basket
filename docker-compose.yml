@@ -1,0 +1,39 @@
+# WHY this file exists: a single `docker compose up --build` must bring up the
+# decoupled backend (Flask API) and frontend (Vite dev server) already wired
+# together, with the project's data and model weights mounted from the host
+# rather than baked into the images.
+services:
+  backend:
+    build:
+      context: ./backend
+    ports:
+      - "5001:5001"
+    volumes:
+      # WHY bind mounts instead of COPY: media and model weights are large and
+      # gitignored, so they must come from the host and stay out of the image.
+      - ./data/raw:/data/raw
+      - ./data/processed:/data/processed
+      - ./backend/models:/app/models
+    environment:
+      FLASK_HOST: 0.0.0.0
+      FLASK_PORT: "5001"
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "5173:5173"
+    environment:
+      # WHY the service name and not localhost: inside the compose network the
+      # API is reachable as `backend`, while `localhost` would point at the
+      # frontend container itself. This is the target of Vite's /api proxy.
+      API_PROXY_TARGET: http://backend:5001
+    depends_on:
+      - backend
+    volumes:
+      # WHY a source mount: the dev server needs HMR, so host edits must be
+      # visible inside the container without rebuilding the image.
+      - ./frontend:/app
+      # WHY an anonymous volume over node_modules: it preserves the modules
+      # installed in the image instead of letting the host folder shadow them.
+      - /app/node_modules

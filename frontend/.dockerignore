@@ -1,0 +1,4 @@
+# WHY: never copy host-installed dependencies or build output into the image;
+# the container installs its own Linux-compatible modules.
+node_modules/
+dist/

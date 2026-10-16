@@ -1,0 +1,10 @@
+# WHY: keep caches, the host virtualenv and the large gitignored payloads out
+# of the build context so builds stay fast and the image stays small.
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+# WHY models/ is ignored: model weights are mounted at runtime, not baked into
+# the image (see docker-compose.yml), so they must not enter the context.
+models/

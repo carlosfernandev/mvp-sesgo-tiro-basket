@@ -83,8 +83,15 @@ Out of scope (deliberately deferred):
       `data/raw/*` and `data/processed/*` ignore the payloads (nested session files included)
       while the two `.gitkeep` files stay tracked - only those 2 files entered the index.
       No code path referenced `outputs/`.
-- [ ] F3. Infra: `backend/Dockerfile`, `frontend/Dockerfile`, `docker-compose.yml`.
-      Check: `docker compose config` parses.
+- [x] F3. Infra: `backend/Dockerfile` (python:3.11-slim + ffmpeg/libgl1/libglib2.0-0,
+      :5001, `FLASK_HOST=0.0.0.0`, path env vars pointed at the mounted volumes so no
+      CWD-anchored fallback is ever used), `frontend/Dockerfile` (node:20-alpine, Vite
+      dev + HMR, :5173), root `docker-compose.yml` (backend + frontend,
+      `API_PROXY_TARGET=http://backend:5001`, bind mounts `./data/raw`, `./data/processed`,
+      `./backend/models`), plus one `.dockerignore` per build context.
+      Check PASS: `docker compose config` exit 0; the parsed output resolves all three
+      bind mounts and the `/app/node_modules` anonymous volume, and frontend
+      `depends_on` backend. Image build/runtime smoke is deferred to F5.
 - [ ] F4. Docs + root cleanup: README rewrite, root `package.json` (it still points at
       the deleted `packages/api` and at a root-level `test_analisis_tiro`), delete the now
       empty `packages/` and the leftover root `__pycache__/`. Stale references found while
@@ -123,6 +130,14 @@ Out of scope (deliberately deferred):
   `opencode.jsonc.pre-deepseek-review-20261016-114552`); verified: JSONC parses, 14 agents,
   exactly those 5 on deepseek, model present in the catalog. OpenCode does not reload config
   in-process, so an operator restart is required before relaunching the reviewers.
+- L6 (2026-10-16, F3 done): wrote `backend/Dockerfile`, `frontend/Dockerfile`,
+  `docker-compose.yml` and one `.dockerignore` per build context. `docker compose
+  config` parses (exit 0) and resolves all three bind mounts plus the
+  `/app/node_modules` anonymous volume. The backend image deliberately does NOT bake
+  model weights or media: `MODEL_PATH`, `DATA_RAW_DIR`, `DATA_PROCESSED_DIR` and
+  `ANALISIS_RESULTS_DIR` are set to the mounted container paths so the code never
+  falls back to the CWD-anchored defaults. Full image build + runtime smoke is
+  deferred to F5 (`docker compose up --build`).
 - L5 (2026-10-16, evidence): F1 done. The root `node_modules/@sesgo/web` workspace symlink
   pointed at the moved directory, so it was removed (root `node_modules` is gitignored).
   Gotcha for later: `pkill -f 'vite --port <n>'` self-terminates the invoking shell, because
@@ -131,8 +146,14 @@ Out of scope (deliberately deferred):
   OpenCode restart), which is why the first proxy probe with `http_code=500` proved nothing.
 
 ## Next step
-1. Operator restarts OpenCode so the deepseek assignment loads (only the user can do this;
-   killing PID 206978 would kill this session).
-2. Re-query the exact-lineage STATUS, then relaunch the 4 reviewers in one grouped response
-   in provider order, passing ONLY the bare binding line as `prompt`.
-3. Then F1: move `packages/web` to `frontend/` and wire the proxy to `API_PROXY_TARGET`.
+1. F4 - docs + root cleanup: README rewrite (via the `cognitive-doc-design` skill), root
+   `package.json` (still points at the deleted `packages/api` and at a root-level
+   `test_analisis_tiro`), delete the now-empty `packages/` and the leftover root
+   `__pycache__/`, and fix the stale `outputs/` wording in `frontend/README.md`,
+   `frontend/src/components/EmptyState.tsx:13` and the `app.py` session-id comment.
+2. F5 verification: 84 tests, `tsc --noEmit && vite build`, `docker compose config`.
+3. F6 work-unit commits per completed phase on `multiple-video-detector` (F3 already
+   committed).
+4. The frozen RDD review of the T2 candidate stays parked at 3/4 lenses; the
+   `review-readability` capture is blocked pending an operator decision (see
+   `estado_actual.md`).
