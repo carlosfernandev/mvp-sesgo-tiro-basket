@@ -1,16 +1,15 @@
+# Python
 /.venv
-/__pycache__
 __pycache__/
+
+# Node
 node_modules/
 dist/
-/angles_video3.csv
-/angulos_tiro.csv
-/feedback.mp4
-/feedback2.mp4
-/feedback3.mp4
-/perfil_angular.png
-/plot_video3.png
-/video.mp4
-/video.webm
-/video2.mp4
-/video3.mp4
+
+# Analysis payloads: raw inputs and processed outputs stay out of git. Only the
+# directory placeholders are committed, so the expected layout stays discoverable
+# without versioning multi-megabyte videos or per-session result files.
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep

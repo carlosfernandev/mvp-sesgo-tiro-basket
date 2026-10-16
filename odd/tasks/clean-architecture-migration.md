@@ -74,14 +74,24 @@ Out of scope (deliberately deferred):
       probe: a control listener on `127.0.0.1:55998` received `GET /api/probe.txt` through
       Vite with `API_PROXY_TARGET=http://127.0.0.1:55998`, proving the env target is honoured
       and not the `5001` default.
-- [ ] F2. Data cleanup: root videos -> `data/raw/`, CSVs/plots/session outputs ->
-      `data/processed/`; add `.gitkeep` to both and gitignore the payloads. Root media
-      files are untracked today, so this is a plain `mv`.
-      Check: no root `*.mp4|*.webm|*.csv|*.png` left; both dirs keep a `.gitkeep`.
+- [x] F2. Data cleanup: 9 videos -> `data/raw/`; 3 CSVs + 3 PNGs -> `data/processed/`; the
+      legacy `outputs/` results dir merged into `data/processed/` (its `tiro_*`/`tiro_demo`
+      session dirs are exactly what the API writes into `results_dir`, so nesting them under
+      an `outputs/` subdir would have made the API read `outputs` as a session id).
+      Root media files were untracked, so this was a plain `mv`.
+      Check PASS: no root `*.mp4|*.webm|*.csv|*.png` left; `git check-ignore` confirms
+      `data/raw/*` and `data/processed/*` ignore the payloads (nested session files included)
+      while the two `.gitkeep` files stay tracked - only those 2 files entered the index.
+      No code path referenced `outputs/`.
 - [ ] F3. Infra: `backend/Dockerfile`, `frontend/Dockerfile`, `docker-compose.yml`.
       Check: `docker compose config` parses.
 - [ ] F4. Docs + root cleanup: README rewrite, root `package.json` (it still points at
-      the deleted `packages/api` and at a root-level `test_analisis_tiro`), delete `packages/`.
+      the deleted `packages/api` and at a root-level `test_analisis_tiro`), delete the now
+      empty `packages/` and the leftover root `__pycache__/`. Stale references found while
+      doing F2, all message/doc text rather than code paths, so they belong to this pass:
+      `frontend/README.md` (`packages/api/app.py`, `ANALISIS_RESULTS_DIR=outputs`),
+      `frontend/src/components/EmptyState.tsx:13` (`--salida-dir outputs/mi_tiro/` hint shown
+      in the UI), and a stale `outputs/` wording in the `app.py` session-id comment.
 - [ ] F5. Verification: 84 tests, `tsc --noEmit && vite build`, `docker compose config`.
 - [ ] F6. Work-unit commits (branch `multiple-video-detector`).
 
