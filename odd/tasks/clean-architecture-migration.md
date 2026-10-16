@@ -92,13 +92,17 @@ Out of scope (deliberately deferred):
       Check PASS: `docker compose config` exit 0; the parsed output resolves all three
       bind mounts and the `/app/node_modules` anonymous volume, and frontend
       `depends_on` backend. Image build/runtime smoke is deferred to F5.
-- [ ] F4. Docs + root cleanup: README rewrite, root `package.json` (it still points at
-      the deleted `packages/api` and at a root-level `test_analisis_tiro`), delete the now
-      empty `packages/` and the leftover root `__pycache__/`. Stale references found while
-      doing F2, all message/doc text rather than code paths, so they belong to this pass:
-      `frontend/README.md` (`packages/api/app.py`, `ANALISIS_RESULTS_DIR=outputs`),
-      `frontend/src/components/EmptyState.tsx:13` (`--salida-dir outputs/mi_tiro/` hint shown
-      in the UI), and a stale `outputs/` wording in the `app.py` session-id comment.
+- [x] F4. Docs + root cleanup: root `README.md` rewritten (outcome-first layout, env-var
+      table, CLI/API/Docker quick paths, one consolidated `backend/requirements.txt`);
+      `frontend/README.md` de-staled; the UI/CLI hint in
+      `frontend/src/components/EmptyState.tsx` now shows `--salida-dir data/processed/mi_tiro/`;
+      stale `packages/api` + `outputs/` wording fixed in `backend/src/api/app.py` and
+      `frontend/src/api.ts`. Root `package.json` is now a thin orchestrator with no
+      workspaces (`npm --prefix frontend run …` + direct `backend/...` python paths) and the
+      stale root `package-lock.json` (which still pinned `workspaces: ["packages/*"]`) was
+      removed. `packages/` and the leftover root `__pycache__/` deleted.
+      Check PASS: `npm test` -> 84 tests OK; `npm run build:web` -> exit 0; no
+      `packages/(api|web)` or `outputs/` references remain outside the historical `odd/` docs.
 - [ ] F5. Verification: 84 tests, `tsc --noEmit && vite build`, `docker compose config`.
 - [ ] F6. Work-unit commits (branch `multiple-video-detector`).
 
@@ -130,6 +134,17 @@ Out of scope (deliberately deferred):
   `opencode.jsonc.pre-deepseek-review-20261016-114552`); verified: JSONC parses, 14 agents,
   exactly those 5 on deepseek, model present in the catalog. OpenCode does not reload config
   in-process, so an operator restart is required before relaunching the reviewers.
+- L7 (2026-10-16, F4 done - architecture decision): the root npm workspace
+  (`workspaces: ["packages/*"]`) was removed and `frontend/` was made a fully
+  standalone Node project, because `frontend/node_modules` held only Vite caches and the
+  real deps (react/vite/typescript) were hoisted into the ROOT `node_modules`. Dropping the
+  workspace without providing frontend-local deps would have broken `npm run build:web`
+  (Node resolution would have found nothing), so `npm install` was run inside `frontend/`
+  (109 packages; `frontend/package-lock.json` created) and the frontend Dockerfile was
+  switched from `npm install` to `npm ci` for reproducible image builds. Tradeoff recorded:
+  the frontend is now decoupled (own lockfile, own `node_modules`, matches the F3 standalone
+  Docker context) at the cost of a per-project install step; the root `node_modules` is left
+  in place (gitignored, now unused) rather than deleted, so no user file is removed unasked.
 - L6 (2026-10-16, F3 done): wrote `backend/Dockerfile`, `frontend/Dockerfile`,
   `docker-compose.yml` and one `.dockerignore` per build context. `docker compose
   config` parses (exit 0) and resolves all three bind mounts plus the

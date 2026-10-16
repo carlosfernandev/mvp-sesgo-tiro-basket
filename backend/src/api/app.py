@@ -43,10 +43,10 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-# WHY a hardcoded env-var name instead of a CLI flag: the npm workspace script
-# (`npm run dev` in packages/api) and the Vite frontend each spawn the server
-# in different ways, and an env var is the one configuration channel both
-# share without argument plumbing.
+# WHY a hardcoded env-var name instead of a CLI flag: the npm script
+# (`npm run dev:api`) and the Vite frontend each spawn the server in different
+# ways, and an env var is the one configuration channel both share without
+# argument plumbing.
 RESULTS_ENV_VAR = "ANALISIS_RESULTS_DIR"
 
 # WHY this exact filename: it is the default `--csv` basename written by
@@ -648,7 +648,7 @@ def _new_session_id():
 
     WHY timestamp + random hex: a timestamp alone collides on rapid double
     uploads and a bare uuid is unreadable in a directory listing; the UTC
-    timestamp keeps outputs/ sortable by recency while 6 random hex digits
+    timestamp keeps the results dir sortable by recency while 6 random hex digits
     make same-microsecond collisions practically impossible. Only
     alphanumerics and underscores, so it always passes _reject_traversal.
 

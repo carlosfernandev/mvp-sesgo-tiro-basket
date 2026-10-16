@@ -10,7 +10,10 @@ export default function EmptyState() {
         carpeta de salida, por ejemplo:
       </p>
       <pre>
-        <code>python analisis_tiro.py --salida-dir outputs/mi_tiro/ …</code>
+        <code>
+          python backend/src/core/analisis_tiro.py video.mp4 --salida-dir
+          data/processed/mi_tiro/
+        </code>
       </pre>
       <p>
         Cuando la carpeta contenga el archivo{" "}

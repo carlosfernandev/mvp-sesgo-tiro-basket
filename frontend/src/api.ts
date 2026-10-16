@@ -43,7 +43,7 @@ export function perfilUrl(id: string): string {
   return `${API_BASE}/api/sesiones/${encodeURIComponent(id)}/perfil`;
 }
 
-// Client-side mirror of the server upload cap (packages/api/app.py,
+// Client-side mirror of the server upload cap (backend/src/api/app.py,
 // MAX_UPLOAD_BYTES): rejecting an oversized file here saves the user from
 // uploading 200 MB just to receive the 413 the server would send anyway.
 export const MAX_UPLOAD_BYTES = 200 * 1024 * 1024;

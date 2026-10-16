@@ -1,31 +1,78 @@
 # MVP Sesgo Tiro Basket
 
 Extracts sagittal-plane joint angles (elbow, knee, shoulder) from a
-pre-recorded basketball shooting video and segments the shot into phases
+pre-recorded basketball shooting video and segments each shot into phases
 (`preparacion`, `elevacion`, `liberacion`, `seguimiento`).
 
-## Setup (Python 3.11)
+The repository is split into two decoupled applications:
+
+| Directory  | What it is                                          | Runtime     |
+| ---------- | --------------------------------------------------- | ----------- |
+| `backend/` | Analysis engine (`src/core`) + Flask API (`src/api`) | Python 3.11 |
+| `frontend/`| React + TypeScript single-page viewer and uploader   | Node 20     |
+
+## Quick path
+
+1. **Backend environment** (Python 3.11):
+
+   ```bash
+   python3.11 -m venv .venv
+   .venv/bin/pip install -r backend/requirements.txt
+   ```
+
+   `ffmpeg` and `ffprobe` must be on `PATH` (used for in-RAM video decoding
+   and encoding without writing temporary video files to disk).
+
+2. **Frontend dependencies** — `frontend/` is a standalone Node project:
+
+   ```bash
+   cd frontend && npm install
+   ```
+
+3. **Run the platform** — from the repository root, in two terminals:
+
+   ```bash
+   npm run dev:api   # Flask API on :5001
+   npm run dev:web   # Vite dev server on :5173
+   ```
+
+   Open <http://localhost:5173>.
+
+4. **Or run everything in containers:**
+
+   ```bash
+   docker compose up --build   # API :5001 + frontend :5173
+   ```
+
+## Details
+
+| Topic            | Decision                                                                                     |
+| ---------------- | -------------------------------------------------------------------------------------------- |
+| Interpreter      | Python **3.11**, not 3.14: `mediapipe 1.0.1` ships no 3.14 wheels and cannot install there.   |
+| OpenCV           | `backend/requirements.txt` lists `opencv-contrib-python`, NOT `opencv-python`; both break `cv2`. |
+| Pose model       | `backend/models/pose_landmarker_lite.task` must be present (mounted at runtime, never baked in). |
+| Data layout      | Raw videos in `data/raw/`, results in `data/processed/` (both gitignored, `.gitkeep` only).   |
+| Path resolution  | No module resolves paths from the CWD; env vars with absolute `Path(__file__)` fallbacks only. |
+| Frontend deps    | `frontend/` owns its `package.json` and `package-lock.json`; install with `npm install`.      |
+
+### Environment variables
+
+| Variable                                  | Used by     | Default                                         |
+| ----------------------------------------- | ----------- | ----------------------------------------------- |
+| `MODEL_PATH`                              | core        | `backend/models/pose_landmarker_lite.task`      |
+| `DATA_RAW_DIR`                            | core        | `data/raw`                                      |
+| `DATA_PROCESSED_DIR`                      | core        | `data/processed`                                |
+| `ANALISIS_RESULTS_DIR`                    | Flask API   | `DATA_PROCESSED_DIR`, then `data/processed`     |
+| `FLASK_HOST` / `FLASK_PORT`               | Flask API   | `127.0.0.1` / `5001`                            |
+| `API_PROXY_TARGET` / `API_PORT`           | Vite proxy  | `http://127.0.0.1:5001`                         |
+
+### Command line
 
 ```bash
-python3.11 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-```
-
-Why 3.11 and not 3.14: `mediapipe 1.0.1` ships no Python 3.14 wheels, so it
-cannot even be installed there. Python 3.11 is a version with available
-wheels and is therefore the pinned interpreter for this MVP.
-
-Note: `requirements.txt` lists `opencv-contrib-python`, NOT `opencv-python`.
-Installing both breaks `cv2` because they ship the same module.
-
-The pose model (`models/pose_landmarker_lite.task`) must already be present.
-
-## Run
-
-```bash
-.venv/bin/python analisis_tiro.py shot.mp4 [--csv angulos_tiro.csv] \
-    [--plot perfil_angular.png] [--side {auto,left,right}] \
-    [--video-feedback feedback.mp4] [--codec mp4v]
+.venv/bin/python backend/src/core/analisis_tiro.py shot.mp4 \
+    [--csv angulos_tiro.csv] [--plot perfil_angular.png] \
+    [--salida-dir data/processed/mi_tiro/] \
+    [--side {auto,left,right}] [--video-feedback feedback.mp4] [--codec mp4v]
 ```
 
 Outputs:
@@ -41,60 +88,16 @@ Outputs:
   the overlay and the CSV never disagree (single inference pass; coordinates
   are cached, never re-inferred).
 
-Run the tests with:
+Use a distinct `--salida-dir` per shot: without it, every run writes the same
+fixed filenames into `DATA_PROCESSED_DIR` and overwrites the previous one.
+
+## Tests and build
 
 ```bash
-.venv/bin/python -m unittest test_analisis_tiro -v
-```
-
-## Web Platform (Backend API + Frontend Web)
-
-The repository includes a web platform allowing users to inspect historical runs or upload MP4 videos directly through a graphical interface, configuring dominant side (`--side`) and visual feedback overlay (`--feedback`) via UI controls instead of terminal arguments.
-
-### Prerequisites
-
-1. **Backend dependencies:**
-   ```bash
-   python3.11 -m venv .venv
-   .venv/bin/pip install -r requirements.txt
-   .venv/bin/pip install -r requirements-api.txt
-   ```
-   *System requirement:* `ffmpeg` and `ffprobe` must be present on PATH (used for in-RAM decoding and encoding without writing temporary video files to disk).
-
-2. **Frontend dependencies:**
-   ```bash
-   npm install
-   ```
-
-### Running the Platform
-
-From the repository root, start both services in separate terminals:
-
-- **Terminal 1 — Backend API (Flask on port 5001):**
-  ```bash
-  npm run dev:api
-  ```
-  *(Runs `packages/api/app.py` bound to port 5001. Override results directory with `ANALISIS_RESULTS_DIR` if needed).*
-
-- **Terminal 2 — Frontend (Vite on port 5173):**
-  ```bash
-  npm run dev:web
-  ```
-  *(Runs `packages/web` with Vite dev server. The proxy automatically routes `/api/*` requests to `http://127.0.0.1:5001`).*
-
-Open **http://localhost:5173** in your web browser.
-
-### Running Tests & Build
-
-```bash
-# Core analysis tests (Python)
+npm test           # both Python suites (core + API)
 npm run test:analisis
-
-# API tests (Python)
 npm run test:api
-
-# Frontend build & typecheck (TypeScript + Vite)
-npm run build:web
+npm run build:web  # frontend typecheck + production build
 ```
 
 ## Known limitations

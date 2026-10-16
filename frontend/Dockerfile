@@ -6,9 +6,11 @@ FROM node:20-alpine
 WORKDIR /app
 
 # WHY package files copied first: the dependency layer is cached and only
-# rebuilt when the manifest changes, not on every source edit.
-COPY package.json ./
-RUN npm install
+# rebuilt when the lockfile changes, not on every source edit. `npm ci` is
+# used instead of `npm install` so the image gets the exact locked versions
+# and the build stays reproducible.
+COPY package.json package-lock.json ./
+RUN npm ci
 
 COPY . .
 

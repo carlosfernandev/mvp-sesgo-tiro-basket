@@ -2,12 +2,13 @@
   "private": true,
   "name": "mvp-sesgo-tiro-basket",
   "version": "0.1.0",
-  "workspaces": ["packages/*"],
+  "description": "Basketball shot-analysis MVP: a Python backend (core engine + Flask API) and a decoupled React frontend.",
   "scripts": {
-    "dev:api": "npm run dev --workspace packages/api",
-    "dev:web": "npm run dev --workspace packages/web",
-    "build:web": "npm run build --workspace packages/web",
-    "test:analisis": ".venv/bin/python -m unittest test_analisis_tiro",
-    "test:api": ".venv/bin/python -m unittest packages/api/test_app.py"
+    "dev:api": ".venv/bin/python backend/src/api/app.py",
+    "dev:web": "npm --prefix frontend run dev",
+    "build:web": "npm --prefix frontend run build",
+    "test": "npm run test:analisis && npm run test:api",
+    "test:analisis": ".venv/bin/python -m unittest discover -s backend/tests -t backend -p \"test_analisis_tiro.py\"",
+    "test:api": ".venv/bin/python -m unittest discover -s backend/tests -t backend -p \"test_app.py\""
   }
 }
