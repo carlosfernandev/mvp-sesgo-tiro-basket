@@ -4,7 +4,8 @@ Read-only endpoints (GET /api/sesiones...) serve already-generated artifacts
 exactly as before. POST /api/analizar additionally RUNS the analysis on an
 uploaded MP4 entirely in RAM: the video bytes are piped through ffmpeg and
 analisis_tiro.analizar_frames_con_cache without ever touching the filesystem,
-and ONLY the resulting angulos_tiro.csv is persisted to outputs/<id>/. The
+and ONLY the resulting angulos_tiro.csv is persisted to
+<DATA_PROCESSED_DIR>/<id>/. The
 annotated feedback video is re-encoded in memory (fragmented H.264 MP4) and
 kept in a process-local store served at GET /api/analizar/<id>/video, so the
 frontend can play it immediately; it is ephemeral (lost on restart) while the
@@ -20,10 +21,10 @@ video_url. Every failure returns JSON {"error": ...} with an actionable
 message and never a traceback.
 
 Results directory resolution: the ``ANALISIS_RESULTS_DIR`` environment
-variable wins when set; otherwise the repo root is used (two levels above
-this file: ``packages/api/`` -> monorepo root). The historical default output
-of ``analisis_tiro.py`` IS the repo root, so defaulting there keeps local
-development working with zero configuration.
+variable wins when set; otherwise ``DATA_PROCESSED_DIR`` wins when set;
+otherwise the repo-root ``data/processed`` directory is used (three levels
+above this file: ``backend/src/api/`` -> repo root). Every default is an
+absolute path anchored to this file, never to the process CWD.
 
 A session is an immediate subdirectory containing ``angulos_tiro.csv``. A CSV
 sitting directly at the results-dir root is NOT a session: it is the legacy
@@ -40,6 +41,7 @@ import sys
 import threading
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 # WHY a hardcoded env-var name instead of a CLI flag: the npm workspace script
 # (`npm run dev` in packages/api) and the Vite frontend each spawn the server
@@ -137,9 +139,10 @@ def create_app(results_dir=None):
 
     Args:
         results_dir: directory whose immediate subdirectories are scanned for
-            sessions. None resolves via ANALISIS_RESULTS_DIR with fallback to
-            the repo root, so tests can inject a fixtures directory without
-            touching the environment.
+            sessions. None resolves via ANALISIS_RESULTS_DIR, then
+            DATA_PROCESSED_DIR, then the repo-root data/processed fallback,
+            so tests can inject a fixtures directory without touching the
+            environment.
 
     Returns:
         The configured Flask application.
@@ -271,7 +274,7 @@ def create_app(results_dir=None):
           1. ffprobe the bytes for width/height/fps (before decoding).
           2. Stream-decode BGR frames via ffmpeg stdout, one frame at a
              time, through analisis_tiro.analizar_frames_con_cache with side.
-          3. Write ONLY outputs/<id>/angulos_tiro.csv (no plot PNG, no
+          3. Write ONLY <results-dir>/<id>/angulos_tiro.csv (no plot PNG, no
              video file).
           4. If feedback is enabled, re-decode the same bytes, draw the overlay
              with the existing render_feedback_frame helper, and re-encode to
@@ -334,8 +337,12 @@ def create_app(results_dir=None):
                 video_url = None
             rows = _df_to_json_rows(df_fases)
             warnings = _analysis_warnings(df_fases, info)
+            # WHY relative to the results dir and not to the CWD: the response
+            # must be identical no matter where the server process was started,
+            # and RESULTS_DIR is the tree the read-only endpoints serve, so a
+            # "<sid>/angulos_tiro.csv" value stays resolvable by the client.
             try:
-                rel_csv = os.path.relpath(csv_path, os.getcwd())
+                rel_csv = os.path.relpath(csv_path, app.config["RESULTS_DIR"])
             except ValueError:
                 rel_csv = csv_path
             return jsonify({
@@ -386,25 +393,31 @@ def create_app(results_dir=None):
 
 
 def _resolve_results_dir(results_dir):
-    """Absolute results directory: explicit arg, env var, or repo root.
+    """Absolute results directory: explicit arg, env var, or repo fallback.
 
     Args:
         results_dir: explicit directory or None to fall back to the
-            ANALISIS_RESULTS_DIR environment variable and then to the repo
-            root (two levels above this file).
+            ANALISIS_RESULTS_DIR environment variable, then to
+            DATA_PROCESSED_DIR, then to the repo-root data/processed
+            directory (three levels above this file: backend/src/api ->
+            repo root).
 
     Returns:
-        The absolute path of the directory to scan for sessions.
+        The absolute path of the directory to scan for sessions. Never
+        CWD-relative: every fallback is anchored to this file or to an
+        absolute env value.
     """
     if results_dir:
         return os.path.abspath(results_dir)
     env = os.environ.get(RESULTS_ENV_VAR)
     if env:
         return os.path.abspath(env)
-    # WHY two dirname() calls: this file lives at packages/api/app.py, so the
-    # grandparent is the monorepo root regardless of the process cwd.
-    here = os.path.dirname(os.path.abspath(__file__))
-    return os.path.dirname(os.path.dirname(here))
+    processed_env = os.environ.get("DATA_PROCESSED_DIR")
+    if processed_env:
+        return os.path.abspath(processed_env)
+    # WHY parents[3]: this file lives at backend/src/api/app.py, so the
+    # great-grandparent is the repo root regardless of the process cwd.
+    return str(Path(__file__).resolve().parents[3] / "data" / "processed")
 
 
 def _reject_traversal(sid):
@@ -588,19 +601,18 @@ def _summarize_session(results_dir, sid):
     return summary
 
 
-def _repo_root():
-    """Absolute repo root (two levels above this file: packages/api -> root).
+def _backend_root():
+    """Absolute backend root (two levels above this file: api -> src -> backend).
 
     Args: none.
 
-    Returns: the absolute path of the monorepo root.
+    Returns: the absolute path of the backend directory.
     """
-    here = os.path.dirname(os.path.abspath(__file__))
-    return os.path.dirname(os.path.dirname(here))
+    return str(Path(__file__).resolve().parents[2])
 
 
 def _import_analysis():
-    """Import the analysis core from the repo root without touching sys globally.
+    """Import the analysis core as a proper package without CWD coupling.
 
     WHY a lazy import instead of a top-level one: the read-only endpoints work
     with Flask alone, so a machine serving only artifacts should not pay the
@@ -611,10 +623,10 @@ def _import_analysis():
 
     Returns: the imported analisis_tiro module.
     """
-    root = _repo_root()
-    if root not in sys.path:
-        sys.path.insert(0, root)
-    import analisis_tiro
+    backend_root = _backend_root()
+    if backend_root not in sys.path:
+        sys.path.insert(0, backend_root)
+    from src.core import analisis_tiro
     return analisis_tiro
 
 
@@ -624,15 +636,11 @@ def _uploads_base(results_dir):
     Args:
         results_dir: the configured results directory (absolute).
 
-    Returns: results_dir itself when it already IS an outputs directory
-        (ANALISIS_RESULTS_DIR=outputs, the frontend dev setup), else
-        results_dir/outputs. Either way the CSV lands at outputs/<id>/
-        relative to the served tree, so the "only the CSV is persisted"
-        contract holds with a single write.
+    Returns: results_dir itself, so sessions are
+        <DATA_PROCESSED_DIR>/<sid>/angulos_tiro.csv. No "outputs" subdir is
+        ever appended: the results dir IS the processed-data dir.
     """
-    if os.path.basename(os.path.normpath(results_dir)) == "outputs":
-        return results_dir
-    return os.path.join(results_dir, "outputs")
+    return results_dir
 
 
 def _new_session_id():
@@ -1149,6 +1157,14 @@ app = create_app()
 
 
 if __name__ == "__main__":
+    # WHY Path(__file__): running this file directly (python
+    # backend/src/api/app.py from any CWD) needs backend/ on sys.path for the
+    # `src.*` package imports; the file-anchored path never depends on CWD.
+    _backend_dir = str(Path(__file__).resolve().parents[2])
+    if _backend_dir not in sys.path:
+        sys.path.insert(0, _backend_dir)
     # WHY port 5001 and not 5000: macOS reserves 5000 for AirPlay, so 5001 is
-    # the Flask dev default that works on every developer machine.
-    app.run(host="127.0.0.1", port=5001)
+    # the Flask dev default that works on every developer machine. Host/port
+    # come from FLASK_HOST/FLASK_PORT so containers can inject 0.0.0.0.
+    app.run(host=os.environ.get("FLASK_HOST", "127.0.0.1"),
+            port=int(os.environ.get("FLASK_PORT", "5001")))

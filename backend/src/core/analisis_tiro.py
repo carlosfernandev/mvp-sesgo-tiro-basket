@@ -5,7 +5,7 @@ VIDEO mode) -> per-frame elbow/knee/shoulder angles on the dominant side ->
 smooth the elbow signal -> segment the shot into phases -> CSV + plot.
 
 Usage:
-    .venv/bin/python analisis_tiro.py shot.mp4 [--csv angulos_tiro.csv]
+    .venv/bin/python backend/src/core/analisis_tiro.py shot.mp4 [--csv angulos_tiro.csv]
         [--plot perfil_angular.png] [--side {auto,left,right}]
 """
 
@@ -14,6 +14,7 @@ import math
 import os
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 import matplotlib
 
@@ -30,7 +31,30 @@ from mediapipe.tasks.python.vision import PoseLandmark, PoseLandmarksConnections
 
 # --- Module-level constants -------------------------------------------------
 
-DEFAULT_MODEL_PATH = os.path.join("models", "pose_landmarker_lite.task")
+# WHY Path(__file__) instead of a relative default: this module must run from
+# any process CWD (`python backend/src/core/analisis_tiro.py` from the repo
+# root or anywhere else), so the model path is anchored to this file
+# (core -> src -> backend) with an env override for containers/tests.
+DEFAULT_MODEL_PATH = os.environ.get(
+    "MODEL_PATH",
+    str(Path(__file__).resolve().parents[2] / "models" / "pose_landmarker_lite.task"),
+)
+
+# WHY Path(__file__) with parents[3]: the repo root is three levels above
+# this file (core -> src -> backend -> root), so raw/processed data dirs are
+# absolute regardless of the process CWD. Env vars win for containers/tests.
+DATA_RAW_DIR = Path(
+    os.environ.get(
+        "DATA_RAW_DIR",
+        str(Path(__file__).resolve().parents[3] / "data" / "raw"),
+    )
+)
+DATA_PROCESSED_DIR = Path(
+    os.environ.get(
+        "DATA_PROCESSED_DIR",
+        str(Path(__file__).resolve().parents[3] / "data" / "processed"),
+    )
+)
 
 # Smoothing window for the elbow signal, calibrated as ~5 frames at 60 fps and
 # scaled linearly with the clip fps (clamped to a minimum of 3). A centered
@@ -1093,7 +1117,7 @@ def analizar_frames_con_cache(frames_iter, fps, width, height, side="auto",
     WHY an iterator instead of a video path: cv2.VideoCapture only accepts a
     file path, so an upload that must never touch disk cannot be decoded with
     OpenCV at all. The API decodes with ffmpeg piped from RAM (see
-    packages/api/app.py) and streams BGR frames frame by frame through this
+    backend/src/api/app.py) and streams BGR frames frame by frame through this
     iterator, so the whole decoded clip is never buffered as raw pixels (a
     10 s 1080p clip is gigabytes of raw BGR).
 
@@ -1284,15 +1308,26 @@ def analizar_frames(frames_iter, fps, width, height, side="auto",
     return df_fases
 
 
-def procesar_video(ruta_video, ruta_csv="angulos_tiro.csv", ruta_plot="perfil_angular.png",
-                   side="auto", model_path=DEFAULT_MODEL_PATH):
+def procesar_video(ruta_video, ruta_csv=None, ruta_plot=None,
+                   side="auto", model_path=None):
     """Run the full pipeline on a pre-recorded video.
 
     Reads frames, runs pose inference, extracts sagittal-plane angles on the
     dominant side, segments phases, writes the CSV and the plot, and prints a
     console summary. Exits non-zero if the video cannot be opened.
+
+    A None ruta_csv/ruta_plot/model_path falls back to DATA_PROCESSED_DIR /
+    DEFAULT_MODEL_PATH, which are absolute (anchored to this file, never to
+    the process CWD); an explicit path is always honored verbatim.
     """
     import cv2
+
+    if model_path is None:
+        model_path = DEFAULT_MODEL_PATH
+    if ruta_csv is None:
+        ruta_csv = str(DATA_PROCESSED_DIR / "angulos_tiro.csv")
+    if ruta_plot is None:
+        ruta_plot = str(DATA_PROCESSED_DIR / "perfil_angular.png")
 
     cap = cv2.VideoCapture(ruta_video)
     if not cap.isOpened():
@@ -1864,25 +1899,34 @@ def main(argv=None):
     )
     parser.add_argument("video", help="Path to the pre-recorded video file.")
     parser.add_argument("--csv", default=None,
-                        help="Output CSV path (default: 'angulos_tiro.csv' in the "
-                             "current directory, or inside --salida-dir when given).")
+                        help="Output CSV path (default: <DATA_PROCESSED_DIR>/"
+                             "angulos_tiro.csv, or inside --salida-dir when given; "
+                             "override the directory with the DATA_PROCESSED_DIR "
+                             "env var).")
     parser.add_argument("--plot", default=None,
-                        help="Output plot path (default: 'perfil_angular.png' in the "
-                             "current directory, or inside --salida-dir when given).")
+                        help="Output plot path (default: <DATA_PROCESSED_DIR>/"
+                             "perfil_angular.png, or inside --salida-dir when "
+                             "given; override the directory with the "
+                             "DATA_PROCESSED_DIR env var).")
     parser.add_argument("--salida-dir", default=None, metavar="DIR",
                         help="Directory that collects every artifact of this run. "
                              "Without it every run writes the same fixed filenames "
-                             "into the current directory, so analyzing a second "
-                             "shot OVERWRITES the first one, which destroys the "
-                             "reference you need to compare against. Use a distinct "
-                             "directory per analyzed shot. An explicit --csv, "
-                             "--plot or --video-feedback path is always respected "
-                             "verbatim and is never relocated into this directory.")
+                             "into DATA_PROCESSED_DIR (absolute, anchored to this "
+                             "file; override with the DATA_PROCESSED_DIR env var), "
+                             "so analyzing a second shot OVERWRITES the first one, "
+                             "which destroys the reference you need to compare "
+                             "against. Use a distinct directory per analyzed shot. "
+                             "An explicit --csv, --plot or --video-feedback path "
+                             "is always respected verbatim and is never relocated "
+                             "into this directory.")
     parser.add_argument("--side", choices=("auto", "left", "right"), default="auto",
                         help="Dominant side; 'auto' picks the side with higher "
                         "mean landmark visibility.")
     parser.add_argument("--model", default=DEFAULT_MODEL_PATH,
-                        help="Path to the pose_landmarker .task model file.")
+                        help="Path to the pose_landmarker .task model file "
+                             "(default: backend/models/pose_landmarker_lite.task "
+                             "next to this file; override with the MODEL_PATH "
+                             "env var).")
     parser.add_argument("--video-feedback", default=None, metavar="RUTA",
                         help="Optional output path for an annotated MP4 with "
                         "skeleton, joint angles and phases burned in. "
@@ -1895,7 +1939,8 @@ def main(argv=None):
 
     # Resolve output paths. A path the caller spelled out is used verbatim; only
     # the DEFAULTS are relocated, so passing --salida-dir can never silently
-    # move a file the user explicitly asked for somewhere else.
+    # move a file the user explicitly asked for somewhere else. Defaults land
+    # under DATA_PROCESSED_DIR (absolute, never the process CWD).
     csv_path = args.csv
     plot_path = args.plot
     feedback_path = args.video_feedback
@@ -1907,8 +1952,8 @@ def main(argv=None):
         # a second full inference pass, so asking for it stays an explicit choice.
         if feedback_path and not os.path.dirname(feedback_path):
             feedback_path = os.path.join(args.salida_dir, feedback_path)
-    csv_path = csv_path or "angulos_tiro.csv"
-    plot_path = plot_path or "perfil_angular.png"
+    csv_path = csv_path or str(DATA_PROCESSED_DIR / "angulos_tiro.csv")
+    plot_path = plot_path or str(DATA_PROCESSED_DIR / "perfil_angular.png")
 
     procesar_video(args.video, ruta_csv=csv_path, ruta_plot=plot_path,
                    side=args.side, model_path=args.model)

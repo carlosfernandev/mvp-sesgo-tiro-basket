@@ -1,19 +1,24 @@
-"""Unit tests for analisis_tiro (unittest only, no pytest dependency)."""
+"""Unit tests for backend/src/core/analisis_tiro.py (unittest only, no pytest dependency)."""
 
 import contextlib
 import io
 import math
 import sys
-import os
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# WHY Path(__file__): tests must run from any CWD
+# (`python -m unittest discover -s backend/tests -t backend`), so the
+# backend/ root is anchored to this file, never to the process CWD.
+BACKEND_ROOT = Path(__file__).resolve().parents[1]
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
 
 import pandas as pd
 import numpy as np
 
-from analisis_tiro import (
+from src.core.analisis_tiro import (
     BASE_FPS,
     COL_ELBOW,
     COL_KNEE,
@@ -582,7 +587,7 @@ class TestDetectarFasesPorTiro(unittest.TestCase):
         )
 
 
-from analisis_tiro import (
+from src.core.analisis_tiro import (
     MAX_DETECTED_POSES,
     MIN_SHOOTER_EXCURSION_DEG,
     MIN_SHOOTER_VALID_FRACTION,

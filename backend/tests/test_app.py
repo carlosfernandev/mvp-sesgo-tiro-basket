@@ -1,22 +1,22 @@
-"""Unit tests for packages/api/app.py Flask application."""
+"""Unit tests for backend/src/api/app.py Flask application."""
 
 import os
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-# Ensure root and packages/api are in sys.path
-HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(os.path.dirname(HERE))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
-if HERE not in sys.path:
-    sys.path.insert(0, HERE)
+# WHY Path(__file__): tests must run from any CWD
+# (`python -m unittest discover -s backend/tests -t backend`), so the
+# backend/ root is anchored to this file, never to the process CWD.
+BACKEND_ROOT = Path(__file__).resolve().parents[1]
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
 
 import pandas as pd
 
-from packages.api.app import (
+from src.api.app import (
     _VIDEO_LOCK,
     _VIDEO_STORE,
     _analyze_upload_bytes,
@@ -89,9 +89,9 @@ class TestApp(unittest.TestCase):
             data = res.get_json()
             self.assertIn("no video bytes received", data.get("error", ""))
 
-    @patch("packages.api.app._render_feedback_mp4")
-    @patch("packages.api.app._analyze_upload_bytes")
-    @patch("packages.api.app._probe_video_bytes")
+    @patch("src.api.app._render_feedback_mp4")
+    @patch("src.api.app._analyze_upload_bytes")
+    @patch("src.api.app._probe_video_bytes")
     def test_analizar_feedback_false_skips_video_rendering(
         self, mock_probe, mock_analyze, mock_render
     ):
@@ -150,9 +150,9 @@ class TestApp(unittest.TestCase):
         res_video = self.client.get(f"/api/analizar/{sid}/video")
         self.assertEqual(res_video.status_code, 404)
 
-    @patch("packages.api.app._render_feedback_mp4")
-    @patch("packages.api.app._analyze_upload_bytes")
-    @patch("packages.api.app._probe_video_bytes")
+    @patch("src.api.app._render_feedback_mp4")
+    @patch("src.api.app._analyze_upload_bytes")
+    @patch("src.api.app._probe_video_bytes")
     def test_analizar_feedback_true_renders_video(
         self, mock_probe, mock_analyze, mock_render
     ):
@@ -200,9 +200,9 @@ class TestApp(unittest.TestCase):
         self.assertEqual(res_video.data, b"rendered-h264-mp4-stream")
         self.assertEqual(res_video.mimetype, "video/mp4")
 
-    @patch("packages.api.app._render_feedback_mp4")
-    @patch("packages.api.app._analyze_upload_bytes")
-    @patch("packages.api.app._probe_video_bytes")
+    @patch("src.api.app._render_feedback_mp4")
+    @patch("src.api.app._analyze_upload_bytes")
+    @patch("src.api.app._probe_video_bytes")
     def test_analizar_feedback_falsy_values(
         self, mock_probe, mock_analyze, mock_render
     ):
@@ -233,8 +233,8 @@ class TestApp(unittest.TestCase):
             self.assertIsNone(data.get("video_url"))
             mock_render.assert_not_called()
 
-    @patch("packages.api.app._PipeDecoder")
-    @patch("packages.api.app._import_analysis")
+    @patch("src.api.app._PipeDecoder")
+    @patch("src.api.app._import_analysis")
     def test_analyze_upload_bytes_passes_side(self, mock_import, mock_decoder_cls):
         """_analyze_upload_bytes passes side parameter to analizar_frames_con_cache."""
         mock_analisis = MagicMock()

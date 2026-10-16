@@ -1,9 +1,0 @@
-{
-  "private": true,
-  "name": "@sesgo/api",
-  "version": "0.1.0",
-  "scripts": {
-    "dev": "ANALISIS_RESULTS_DIR=${ANALISIS_RESULTS_DIR:-../..} ../../.venv/bin/python app.py",
-    "start": "ANALISIS_RESULTS_DIR=${ANALISIS_RESULTS_DIR:-../..} ../../.venv/bin/python app.py"
-  }
-}
