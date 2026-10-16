@@ -21,15 +21,20 @@ from analisis_tiro import (
     COL_SHOULDER,
     COL_TIMESTAMP,
     MAX_SHOT_SPAN_MS,
+    MIN_DIP_PROMINENCE_DEG,
     MIN_PHASE_DURATION_MS,
+    MIN_SHOT_SEPARATION_MS,
     PHASE_FOLLOW,
     PHASE_PREP,
     PHASE_RELEASE,
     PHASE_RISE,
     PHASE_UNKNOWN,
+    VentanaTiro,
     arc_angles_deg,
     calcular_angulo,
     detectar_fases,
+    detectar_fases_por_tiro,
+    detectar_tiros,
     draw_joint_arc,
     draw_phase_boundaries,
     draw_phase_strip,
@@ -449,6 +454,369 @@ class TestPlausibilidadFases(unittest.TestCase):
         snapshot = df.copy(deep=True)
         verificar_plausibilidad_fases(df, self.FPS)
         pd.testing.assert_frame_equal(df, snapshot)
+
+
+def make_session_df(n_shots, fps=60.0):
+    """Synthetic multi-shot elbow signal: idle 130, dip 72, snap peak 168.
+
+    One 90-frame block per shot (32 idle + 18 down + 25 up + 15 relax), so
+    each dip-peak rise is ~96 deg and consecutive dips are 90 frames apart.
+    UNVALIDATED on real footage: a clean stand-in for tuning the detector,
+    not a biomechanical claim.
+    """
+    elbow = []
+    for _ in range(n_shots):
+        elbow += [130.0] * 32
+        elbow += list(np.linspace(130.0, 72.0, 19)[1:])
+        elbow += list(np.linspace(72.0, 168.0, 26)[1:])
+        elbow += list(np.linspace(168.0, 130.0, 16)[1:])
+    return make_df(elbow, fps=fps)
+
+
+class TestDetectarTiros(unittest.TestCase):
+    FPS = 60.0
+
+    def test_ten_shots_yield_ten_windows(self):
+        df = make_session_df(10, fps=self.FPS)
+        self.assertEqual(len(df), 900)
+        windows = detectar_tiros(df)
+        self.assertEqual(len(windows), 10)
+
+    def test_single_shot_yields_one_window(self):
+        df = make_session_df(1, fps=self.FPS)
+        windows = detectar_tiros(df)
+        self.assertEqual(len(windows), 1)
+        w = windows[0]
+        self.assertLessEqual(w.inicio, w.valle)
+        self.assertLess(w.valle, w.pico)
+        self.assertLess(w.pico, w.fin)
+        self.assertEqual(w.fin, len(df))
+
+    def test_windows_tile_without_overlap_or_gaps(self):
+        df = make_session_df(3, fps=self.FPS)
+        windows = detectar_tiros(df)
+        self.assertEqual(windows[0].fin, windows[1].inicio)
+        self.assertEqual(windows[1].fin, windows[2].inicio)
+        for w in windows:
+            self.assertGreater(len(df.iloc[w.inicio:w.fin]), 0)
+            self.assertLessEqual(w.inicio, w.valle)
+            self.assertLess(w.valle, w.pico)
+            self.assertLess(w.pico, w.fin)
+
+    def test_flat_signal_yields_empty(self):
+        df = make_df([130.0] * 90, fps=self.FPS)
+        self.assertEqual(detectar_tiros(df), [])
+
+    def test_all_nan_yields_empty_without_raising(self):
+        df = make_df([float("nan")] * 90, fps=self.FPS)
+        self.assertEqual(detectar_tiros(df), [])
+
+    def test_empty_dataframe_yields_empty_without_raising(self):
+        self.assertEqual(detectar_tiros(pd.DataFrame()), [])
+
+    def test_single_dip_without_peak_yields_empty(self):
+        elbow = [130.0] * 20 + list(np.linspace(130.0, 72.0, 11)[1:])
+        df = make_df(elbow, fps=self.FPS)
+        self.assertEqual(detectar_tiros(df), [])
+
+    def test_shallow_dribble_dip_is_not_a_shot(self):
+        # Dribble-scale wiggle: dip to 95, recover to 130 (rise 35 deg,
+        # below MIN_DIP_PROMINENCE_DEG). Must not add a window.
+        dribble = list(np.linspace(130.0, 95.0, 9)[1:])
+        dribble += list(np.linspace(95.0, 130.0, 9)[1:])
+        elbow = list(make_session_df(1, fps=self.FPS)["ángulo_codo"])
+        elbow += [130.0] * 20 + dribble + [130.0] * 20
+        windows = detectar_tiros(make_df(elbow, fps=self.FPS))
+        self.assertEqual(len(windows), 1)
+
+    def test_minimum_separation_merges_close_dips(self):
+        # Two shot-deep dips ~250 ms apart (below MIN_SHOT_SEPARATION_MS):
+        # one window, not two.
+        elbow = [130.0] * 20
+        elbow += list(np.linspace(130.0, 72.0, 11)[1:])
+        elbow += list(np.linspace(72.0, 168.0, 12)[1:])
+        elbow += list(np.linspace(168.0, 72.0, 9)[1:])
+        elbow += list(np.linspace(72.0, 168.0, 12)[1:])
+        elbow += list(np.linspace(168.0, 130.0, 12)[1:])
+        elbow += [130.0] * 20
+        windows = detectar_tiros(make_df(elbow, fps=self.FPS))
+        self.assertEqual(len(windows), 1)
+
+    def test_does_not_mutate_input(self):
+        df = make_session_df(2, fps=self.FPS)
+        snapshot = df.copy(deep=True)
+        detectar_tiros(df)
+        pd.testing.assert_frame_equal(df, snapshot)
+
+
+class TestDetectarFasesPorTiro(unittest.TestCase):
+    FPS = 60.0
+
+    def test_each_window_gets_its_own_phases(self):
+        df = make_session_df(3, fps=self.FPS)
+        pairs = detectar_fases_por_tiro(df)
+        self.assertEqual(len(pairs), 3)
+        for window, dfw in pairs:
+            self.assertIsInstance(window, VentanaTiro)
+            self.assertIn("fase_asignada", dfw.columns)
+            phases = set(dfw["fase_asignada"])
+            for expected in (PHASE_PREP, PHASE_RISE, PHASE_RELEASE):
+                self.assertIn(expected, phases)
+
+    def test_single_shot_csv_keeps_exact_original_columns(self):
+        df = make_session_df(1, fps=self.FPS)
+        out = detectar_fases(df)
+        self.assertEqual(
+            list(out.columns),
+            ["frame", "timestamp", "ángulo_codo", "ángulo_rodilla",
+             "ángulo_hombro", "fase_asignada"],
+        )
+        self.assertNotIn("tiro_id", out.columns)
+        buf = io.StringIO()
+        out.to_csv(buf, index=False)
+        header = buf.getvalue().splitlines()[0]
+        self.assertEqual(
+            header,
+            "frame,timestamp,ángulo_codo,ángulo_rodilla,"
+            "ángulo_hombro,fase_asignada",
+        )
+
+
+from analisis_tiro import (
+    MAX_DETECTED_POSES,
+    MIN_SHOOTER_EXCURSION_DEG,
+    MIN_SHOOTER_VALID_FRACTION,
+    MIN_SHOOTER_VISIBILITY,
+    REQUIRED_PARTS,
+    SIDE_JOINTS,
+    ShooterCandidate,
+    _select_side,
+    assess_shooter_candidates,
+    elbow_signal_deg,
+    mean_required_visibility,
+    print_election_report,
+    robust_excursion_deg,
+    select_shooter,
+    split_person_series,
+)
+
+
+TEST_WIDTH = TEST_HEIGHT = 640
+
+
+def make_pose(elbow_deg, side="right", vis_left=0.9, vis_right=0.9):
+    """One synthetic 33-landmark pose whose `side` elbow angle is elbow_deg.
+
+    Shoulder/elbow/wrist are placed in pixel geometry giving exactly elbow_deg
+    at the elbow; all other joints sit at fixed non-degenerate positions. The
+    frame is square so to_pixel introduces no aspect distortion. The OPPOSITE
+    side joints are left coincident (degenerate on purpose): its signal reads
+    NaN, so the configured side always drives the election, mimicking a
+    lateral view where only the camera-facing side is measurable.
+    """
+    lms = [SimpleNamespace(x=320.0 / TEST_WIDTH, y=320.0 / TEST_HEIGHT,
+                           visibility=0.9) for _ in range(33)]
+    parts = SIDE_JOINTS[side]
+    sx, sy = 100.0, 100.0
+    ex, ey = 200.0, 100.0
+    phi = math.radians(180.0 - elbow_deg)
+    wx, wy = ex + 50.0 * math.cos(phi), ey + 50.0 * math.sin(phi)
+    lms[parts["shoulder"].value] = SimpleNamespace(x=sx / TEST_WIDTH, y=sy / TEST_HEIGHT, visibility=0.9)
+    lms[parts["elbow"].value] = SimpleNamespace(x=ex / TEST_WIDTH, y=ey / TEST_HEIGHT, visibility=0.9)
+    lms[parts["wrist"].value] = SimpleNamespace(x=wx / TEST_WIDTH, y=wy / TEST_HEIGHT, visibility=0.9)
+    hip, knee, ankle = parts["hip"].value, parts["knee"].value, parts["ankle"].value
+    lms[hip] = SimpleNamespace(x=300.0 / TEST_WIDTH, y=300.0 / TEST_HEIGHT, visibility=0.9)
+    lms[knee] = SimpleNamespace(x=300.0 / TEST_WIDTH, y=350.0 / TEST_HEIGHT, visibility=0.9)
+    lms[ankle] = SimpleNamespace(x=310.0 / TEST_WIDTH, y=400.0 / TEST_HEIGHT, visibility=0.9)
+    for s, v in (("left", vis_left), ("right", vis_right)):
+        for part in REQUIRED_PARTS:
+            lms[SIDE_JOINTS[s][part].value].visibility = v
+    return lms
+
+
+def person_frames_from_elbows(elbows, present=None, **pose_kwargs):
+    """One person's frame series; elbows[i]=None (or present[i]=False) -> missing."""
+    series = []
+    for i, angle in enumerate(elbows):
+        if angle is None or (present is not None and not present[i]):
+            series.append(None)
+        else:
+            series.append(make_pose(angle, **pose_kwargs))
+    return series
+
+
+def run_with_stdout(func, *args, **kwargs):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        result = func(*args, **kwargs)
+    return result, buf.getvalue()
+
+
+SHOOTER_ELBOWS = list(np.linspace(70.0, 170.0, 60))
+STILL_ELBOWS = list(90.0 + 10.0 * np.linspace(0.0, 1.0, 60))
+ARM_MOVER_ELBOWS = list(np.linspace(100.0, 140.0, 60))
+
+
+class TestSplitPersonSeries(unittest.TestCase):
+    def test_missing_person_leaves_none_without_shifting(self):
+        a = [make_pose(90.0), make_pose(91.0), make_pose(92.0)]
+        b = [make_pose(80.0), make_pose(81.0), make_pose(82.0)]
+        frames_poses = [[a[0], b[0]], [a[1]], [a[2], b[2]]]
+        series = split_person_series(frames_poses)
+        self.assertEqual(len(series), 2)
+        self.assertEqual(len(series[0]), 3)
+        self.assertIs(series[1][1], None)
+        self.assertIs(series[0][0], a[0])
+        self.assertIs(series[1][2], b[2])
+
+    def test_empty_input_yields_no_series(self):
+        self.assertEqual(split_person_series([]), [])
+        self.assertEqual(assess_shooter_candidates([], TEST_WIDTH, TEST_HEIGHT), [])
+        self.assertIsNone(select_shooter([]))
+
+
+class TestRobustExcursion(unittest.TestCase):
+    def test_single_glitch_frame_does_not_win(self):
+        signal = [90.0 + ((-1) ** i) for i in range(60)]
+        signal[30] = 170.0
+        self.assertGreater(max(signal) - min(signal), 75.0)
+        self.assertLess(robust_excursion_deg(signal), 10.0)
+
+    def test_sustained_motion_gives_large_excursion(self):
+        self.assertGreater(robust_excursion_deg(SHOOTER_ELBOWS), 80.0)
+
+    def test_nan_frames_are_excluded(self):
+        signal = [float("nan")] * 10 + list(SHOOTER_ELBOWS)
+        self.assertAlmostEqual(robust_excursion_deg(signal),
+                               robust_excursion_deg(SHOOTER_ELBOWS))
+
+    def test_no_finite_values_gives_nan(self):
+        self.assertTrue(math.isnan(robust_excursion_deg([])))
+        self.assertTrue(math.isnan(robust_excursion_deg([float("nan")] * 5)))
+
+
+class TestShooterElection(unittest.TestCase):
+    def elect(self, *people_kwargs):
+        people = [person_frames_from_elbows(**kw) for kw in people_kwargs]
+        n = max(len(p) for p in people)
+        frames_poses = []
+        for i in range(n):
+            poses = [p[i] for p in people if i < len(p) and p[i] is not None]
+            frames_poses.append(poses)
+        series = split_person_series(frames_poses)
+        candidates = assess_shooter_candidates(series, TEST_WIDTH, TEST_HEIGHT)
+        return series, candidates, select_shooter(candidates)
+
+    def test_shooter_wins_over_bystander(self):
+        series, candidates, winner = self.elect(
+            {"elbows": SHOOTER_ELBOWS},
+            {"elbows": STILL_ELBOWS},
+        )
+        self.assertEqual(len(candidates), 2)
+        self.assertTrue(candidates[0].accepted)
+        self.assertGreater(candidates[0].excursion_deg, 80.0)
+        self.assertLess(candidates[1].excursion_deg, 15.0)
+        self.assertFalse(candidates[1].accepted)
+        self.assertEqual(winner, 0)
+
+    def test_larger_excursion_wins_among_accepted(self):
+        series, candidates, winner = self.elect(
+            {"elbows": ARM_MOVER_ELBOWS},
+            {"elbows": SHOOTER_ELBOWS},
+        )
+        self.assertTrue(all(c.accepted for c in candidates))
+        self.assertGreater(candidates[1].excursion_deg,
+                           candidates[0].excursion_deg)
+        self.assertEqual(winner, 1)
+
+    def test_garbage_pose_with_huge_range_is_rejected(self):
+        rng = np.random.RandomState(42)
+        garbage = list(rng.uniform(20.0, 170.0, 60))
+        series, candidates, winner = self.elect(
+            {"elbows": SHOOTER_ELBOWS},
+            {"elbows": garbage, "vis_left": 0.2, "vis_right": 0.2},
+        )
+        by_name = {c.person_index: c for c in candidates}
+        self.assertGreater(by_name[1].excursion_deg, by_name[0].excursion_deg)
+        self.assertFalse(by_name[1].accepted)
+        self.assertIn("visibility", by_name[1].reason)
+        self.assertTrue(by_name[0].accepted)
+        self.assertEqual(winner, 0)
+
+    def test_no_shot_reports_none_without_bogus_winner(self):
+        small_a = [90.0 + 3.0 * math.sin(i) for i in range(60)]
+        small_b = [95.0 + 3.0 * math.cos(i) for i in range(60)]
+        series, candidates, winner = self.elect(
+            {"elbows": small_a}, {"elbows": small_b},
+        )
+        self.assertIsNone(winner)
+        self.assertFalse(any(c.accepted for c in candidates))
+        self.assertTrue(all("excursion" in c.reason for c in candidates))
+        _, out = run_with_stdout(print_election_report, candidates, winner, "auto")
+        self.assertIn("No shooter elected", out)
+        self.assertIn("no shot", out)
+
+    def test_sparse_person_rejected_by_validity_gate(self):
+        present = [i < 5 for i in range(60)]
+        series, candidates, winner = self.elect(
+            {"elbows": SHOOTER_ELBOWS},
+            {"elbows": SHOOTER_ELBOWS, "present": present},
+        )
+        by_name = {c.person_index: c for c in candidates}
+        self.assertFalse(by_name[1].accepted)
+        self.assertIn("fraction", by_name[1].reason)
+        self.assertEqual(winner, 0)
+
+    def test_single_person_behaves_like_current_path(self):
+        frames = person_frames_from_elbows(SHOOTER_ELBOWS)
+        series = split_person_series([[p] if p is not None else [] for p in frames])
+        self.assertEqual(len(series), 1)
+        self.assertEqual(series[0], frames)
+        candidates = assess_shooter_candidates(series, TEST_WIDTH, TEST_HEIGHT)
+        self.assertEqual(len(candidates), 1)
+        self.assertTrue(candidates[0].accepted)
+        self.assertEqual(select_shooter(candidates), 0)
+
+    def test_side_override_bypasses_auto_selection(self):
+        frames = person_frames_from_elbows(SHOOTER_ELBOWS,
+                                           vis_left=0.1, vis_right=0.99)
+        self.assertEqual(_select_side(frames, "auto"), "right")
+        self.assertEqual(_select_side(frames, "left"), "left")
+        self.assertEqual(_select_side(frames, "right"), "right")
+
+    def test_select_side_never_mixes_people(self):
+        # A shoots (left side visible), B stands still (right side visible).
+        # Scoped to A the side is left; mixed across both it flips to right.
+        a = person_frames_from_elbows(SHOOTER_ELBOWS, vis_left=0.6, vis_right=0.1)
+        b = person_frames_from_elbows([95.0] * 60, vis_left=0.1, vis_right=0.99)
+        series = split_person_series([[pa, pb] for pa, pb in zip(a, b)])
+        candidates = assess_shooter_candidates(series, TEST_WIDTH, TEST_HEIGHT)
+        winner = select_shooter(candidates)
+        self.assertEqual(winner, 0)
+        scoped = _select_side(series[winner], "auto")
+        mixed = _select_side([pa if i % 2 == 0 else pb
+                              for i, (pa, pb) in enumerate(zip(a, b))], "auto")
+        self.assertEqual(scoped, "left")
+        self.assertEqual(mixed, "right")
+        self.assertNotEqual(scoped, mixed)
+
+    def test_election_report_is_auditable(self):
+        rng = np.random.RandomState(7)
+        garbage = list(rng.uniform(20.0, 170.0, 60))
+        series, candidates, winner = self.elect(
+            {"elbows": SHOOTER_ELBOWS},
+            {"elbows": garbage, "vis_left": 0.2, "vis_right": 0.2},
+        )
+        _, out = run_with_stdout(print_election_report, candidates, winner, "auto")
+        self.assertIn("person 0", out)
+        self.assertIn("person 1", out)
+        self.assertIn("ACCEPTED", out)
+        self.assertIn("REJECTED", out)
+        self.assertIn("Selected shooter: person 0", out)
+        self.assertIn("UNVALIDATED", out)
+        _, out_override = run_with_stdout(
+            print_election_report, candidates, winner, "left")
+        self.assertIn("override", out_override)
 
 
 if __name__ == "__main__":

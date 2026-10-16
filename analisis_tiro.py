@@ -13,6 +13,7 @@ import argparse
 import math
 import os
 import sys
+from dataclasses import dataclass
 
 import matplotlib
 
@@ -60,6 +61,76 @@ MIN_PHASE_DURATION_MS = 100.0
 # biomechanics: replace it with a high percentile (e.g. p99) of total shot
 # durations from your own annotated reference shots.
 MAX_SHOT_SPAN_MS = 3000.0
+
+# Minimum elbow-angle rise from a dip to its following snap peak, in degrees,
+# for a dip-peak cycle to count as a shot. A real shot snaps from deep elbow
+# flexion to near-full extension, a rise of many tens of degrees, while a
+# dribble wiggle or tracking noise rises far less, so a small rise means "not
+# a shot". Degrees are used instead of frames on purpose: an amplitude
+# compares signal values rather than counting frames, so it is independent of
+# frame rate by construction and means the same physical motion at any fps
+# (a frame-count limit would be silently wrong across videos, as above).
+# PROVISIONAL guess, not measured biomechanics: replace it with a low
+# percentile (e.g. p1) of dip-to-peak rises from your own annotated reference
+# shots.
+MIN_DIP_PROMINENCE_DEG = 40.0
+
+# Minimum time gap between two candidate shots, in milliseconds. Two dips
+# closer than this are treated as one shot and the stronger dip wins: a real
+# follow-through cannot end and a new dip begin faster than this, while a
+# single noisy dip often yields twin minima a few frames apart.
+# Milliseconds are used instead of frames on purpose: a fixed frame count
+# means different physical durations at different frame rates (5 frames are
+# 83 ms at 60 fps but 167 ms at 30 fps), so a frame-based limit would be
+# silently wrong across videos. PROVISIONAL guess, not measured
+# biomechanics: replace it with a low percentile (e.g. p1) of inter-shot dip
+# intervals from your own annotated reference sessions.
+MIN_SHOT_SEPARATION_MS = 600.0
+
+# Maximum number of poses requested from MediaPipe per frame. A session MVP
+# rarely frames more than the shooter plus one other person (assistant,
+# rebounder, bystander), and every extra pose costs inference time on every
+# frame, so asking for a small fixed number bounds the cost while covering
+# the realistic case. PROVISIONAL guess, not a measured need: replace it with
+# the observed person count from your own session footage once multi-person
+# clips exist.
+MAX_DETECTED_POSES = 2
+
+# Minimum fraction of all video frames in which a candidate person must have
+# a valid pose to be electable as the shooter. A person who flickers in and
+# out of detection (occluded passerby, background figure, tracking fragment)
+# can still show a huge RANDOM elbow-angle range from a few glitched frames,
+# and without this gate that noise would outscore the real shooter. Degrees
+# or milliseconds do not apply to a share, so a fraction is used on purpose;
+# it is fps-independent by construction. PROVISIONAL guess, not measured:
+# replace it with the valid-frame share distribution from your own annotated
+# multi-person clips.
+MIN_SHOOTER_VALID_FRACTION = 0.5
+
+# Minimum mean visibility of the required landmarks (over the candidate's
+# valid frames, on their better side) to be electable as the shooter. Low
+# visibility means MediaPipe is guessing the joint positions, and guessed
+# joints produce random angles with a large spurious range, exactly the
+# failure mode this gate exists to stop. The value mirrors the 0.5 pose
+# confidence thresholds already used in the PoseLandmarker options below, so
+# one consistent bar applies to detection and to election. PROVISIONAL guess,
+# not measured: replace it with the visibility distribution of true shooters
+# versus background people from your own annotated multi-person clips.
+MIN_SHOOTER_VISIBILITY = 0.5
+
+# Minimum plausible whole-clip elbow excursion, in degrees, for a candidate
+# to be electable as the shooter. A real shot snaps from deep flexion to
+# near-full extension, rising at least MIN_DIP_PROMINENCE_DEG from dip to
+# peak, so the robust whole-clip excursion of a clip containing a shot must
+# clear a bar just below that rise; anything below it means the clip shows
+# no shot-like motion at all. When NOBODY clears it, the honest answer is
+# "no shot", not the least-bad person. Degrees are used instead of frames
+# on purpose: an amplitude compares signal values rather than counting
+# frames, so it means the same physical motion at any fps. PROVISIONAL
+# guess, not measured biomechanics: replace it with a low percentile (e.g.
+# p1) of whole-clip shooter excursions from your own annotated reference
+# shots.
+MIN_SHOOTER_EXCURSION_DEG = 30.0
 
 # Missing-frame share above which the clip is flagged as unreliable.
 MISSING_WARN_FRACTION = 0.10
@@ -421,7 +492,540 @@ def detectar_fases(df_angulos):
     return df
 
 
+@dataclass(frozen=True)
+class VentanaTiro:
+    """One detected shot window, as a half-open iloc range plus landmarks.
+
+    inicio is the first frame of the window (inclusive) and fin is one past
+    the last frame (exclusive), so the caller slices df.iloc[w.inicio:w.fin].
+    valle is the pre-shot elbow dip and pico is the following snap peak, both
+    as iloc positions with inicio <= valle < pico < fin. Consecutive windows
+    tile without overlap or gaps: each window ends where the next one starts.
+    """
+
+    inicio: int
+    valle: int
+    pico: int
+    fin: int
+
+
+def _extremos_locales(y):
+    """Strict-or-plateau local minima and maxima of a 1-D signal.
+
+    Endpoints are never extrema (one-sided, unconfirmable). A flat plateau
+    counts as an extremum at each of its edge frames, so a flat-bottomed dip
+    still yields candidate minima; the separation filter merges the twins.
+    NaN neighbors disqualify the frame outright.
+    """
+    imin = []
+    imax = []
+    n = len(y)
+    for i in range(1, n - 1):
+        a = y[i - 1]
+        b = y[i]
+        c = y[i + 1]
+        if not (math.isfinite(a) and math.isfinite(b) and math.isfinite(c)):
+            continue
+        if (b <= a and b < c) or (b < a and b <= c):
+            imin.append(i)
+        elif (b >= a and b > c) or (b > a and b >= c):
+            imax.append(i)
+    return imin, imax
+
+
+def detectar_tiros(df_angulos, prominencia_min_deg=None, separacion_min_ms=None):
+    """Locate shot windows in a possibly multi-shot elbow-angle signal.
+
+    Each shot is a dip-peak cycle: a local minimum (the pre-shot elbow dip)
+    followed by a local maximum (the snap peak). Candidates are found on the
+    same centered rolling-mean signal detectar_fases uses, so extrema are not
+    shifted in time, then filtered by minimum prominence (snap peak at least
+    this many degrees above its dip) and minimum separation (dips closer than
+    this are one shot, the stronger dip wins). Each window starts where the
+    signal began descending into its dip (scanning back from the dip) and
+    ends where the next window starts, or at end-of-signal for the last shot.
+    A later window never starts inside an earlier peak: its start is clamped
+    past the previous snap peak, so every window contains its own dip and its
+    own peak.
+
+    This detector is UNVALIDATED on real footage and both limits are
+    provisional guesses. Known limitation: a dribble deep enough to mimic a
+    shot dip (dip as deep, rise as high) is indistinguishable from a shot and
+    WILL be reported as one; prominence and separation are mitigations, not
+    proof. A 15 s session also has more occlusion and NaN gaps than a single
+    clip, so per-frame pose quality matters more here in practice.
+
+    Args:
+        df_angulos: DataFrame with at least the 'ángulo_codo' column (and
+            normally 'frame' + 'timestamp'). It is only read, never mutated.
+        prominencia_min_deg: override for MIN_DIP_PROMINENCE_DEG (tests and
+            tuning). None means the module constant.
+        separacion_min_ms: override for MIN_SHOT_SEPARATION_MS (tests and
+            tuning). None means the module constant.
+
+    Returns:
+        A list of VentanaTiro in time order (empty when nothing plausible is
+        found: empty input, missing column, fewer than 3 valid samples, a
+        flat signal, or dips with no following peak). Input problems print a
+        WARNING on stderr; a clean signal with no shots returns [] silently.
+        Positions are iloc positions, valid for df.iloc[w.inicio:w.fin]. The
+        input DataFrame is never mutated.
+    """
+    if prominencia_min_deg is None:
+        prominencia_min_deg = MIN_DIP_PROMINENCE_DEG
+    if separacion_min_ms is None:
+        separacion_min_ms = MIN_SHOT_SEPARATION_MS
+    if df_angulos is None or len(df_angulos) == 0:
+        print("WARNING: detectar_tiros received an empty DataFrame.", file=sys.stderr)
+        return []
+    if COL_ELBOW not in df_angulos.columns:
+        print(
+            "WARNING: detectar_tiros needs the '%s' column; got %s."
+            % (COL_ELBOW, list(df_angulos.columns)),
+            file=sys.stderr,
+        )
+        return []
+
+    n = len(df_angulos)
+    elbow = pd.to_numeric(df_angulos[COL_ELBOW], errors="coerce")
+    n_valid = int(elbow.notna().sum())
+    if n_valid < 3:
+        print(
+            "WARNING: too few valid elbow samples (%d of %d frames); "
+            "no shot windows can be estimated." % (n_valid, n),
+            file=sys.stderr,
+        )
+        return []
+
+    # Same smoothing as detectar_fases: centered rolling mean over an
+    # fps-scaled window, on an ffill/bfill copy so extrema are well defined.
+    window = _smoothing_window(df_angulos)
+    filled = elbow.ffill().bfill()
+    smooth = filled.rolling(window, center=True, min_periods=1).mean()
+    y = smooth.to_numpy(dtype=float)
+
+    # Frame period from the timestamps (median of the positive diffs),
+    # falling back to BASE_FPS, exactly as the rest of this file does.
+    fps = BASE_FPS
+    if COL_TIMESTAMP in df_angulos.columns and n >= 2:
+        ts = pd.to_numeric(df_angulos[COL_TIMESTAMP], errors="coerce").to_numpy(
+            dtype=float
+        )
+        diffs = np.diff(ts)
+        diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+        if diffs.size > 0:
+            fps = 1.0 / float(np.median(diffs))
+    if not math.isfinite(fps) or fps <= 0:
+        fps = BASE_FPS
+    sep_frames = max(1, int(round(separacion_min_ms / 1000.0 * fps)))
+
+    imin_list, imax_list = _extremos_locales(y)
+
+    # One candidate per dip: the first local maximum strictly after it,
+    # kept only when the rise clears the prominence minimum.
+    candidates = []
+    for dip in imin_list:
+        peak = None
+        for cand in imax_list:
+            if cand > dip:
+                peak = cand
+                break
+        if peak is None:
+            continue
+        prominence = float(y[peak]) - float(y[dip])
+        if prominence >= prominencia_min_deg:
+            candidates.append((dip, peak, prominence))
+
+    # Separation filter, strongest first so the deeper dip wins each merge,
+    # then back to time order for the tiling below.
+    candidates.sort(key=lambda c: c[2], reverse=True)
+    accepted = []
+    for dip, peak, prominence in candidates:
+        if all(abs(dip - kept[0]) >= sep_frames for kept in accepted):
+            accepted.append((dip, peak, prominence))
+    accepted.sort(key=lambda c: c[0])
+
+    # Window starts: scan back from each dip while the signal keeps rising
+    # away from it (i.e. it was descending into the dip). A start is never
+    # allowed inside the previous snap peak, so each window keeps its peak.
+    starts = []
+    for dip, peak, _prominence in accepted:
+        start = dip
+        while start > 0 and y[start - 1] >= y[start]:
+            start -= 1
+        starts.append(start)
+    for k in range(1, len(starts)):
+        prev_peak = accepted[k - 1][1]
+        if starts[k] <= prev_peak:
+            starts[k] = prev_peak + 1
+
+    windows = []
+    for k, (dip, peak, _prominence) in enumerate(accepted):
+        end = starts[k + 1] if k + 1 < len(starts) else n
+        windows.append(VentanaTiro(inicio=starts[k], valle=dip, pico=peak, fin=end))
+    return windows
+
+
+def detectar_fases_por_tiro(df_angulos, prominencia_min_deg=None,
+                            separacion_min_ms=None):
+    """Segment every detected shot with the existing detectar_fases().
+
+    This is the multi-shot path: detectar_tiros() finds the windows and the
+    UNCHANGED single-shot detectar_fases() runs once per window on
+    df.iloc[w.inicio:w.fin] (re-indexed positionally, because detectar_fases
+    addresses frames by position). The single-shot CLI path, its CSV columns,
+    and detectar_fases() itself are untouched by this function.
+
+    Non-final windows end right after their own snap peak (each window ends
+    where the next one starts), so their 'seguimiento' is minimal by
+    construction: in a session the frames after one peak ARE the next shot's
+    preparation and cannot belong to both. Only the last window shows a full
+    follow-through. Like detectar_tiros, this is UNVALIDATED on real footage
+    and inherits its dribble-confusion limitation.
+
+    Args:
+        df_angulos: DataFrame with at least the 'ángulo_codo' column. It is
+            only read, never mutated.
+        prominencia_min_deg: passed through to detectar_tiros.
+        separacion_min_ms: passed through to detectar_tiros.
+
+    Returns:
+        A list of (VentanaTiro, DataFrame) pairs in time order, one per
+        detected shot; the DataFrame is the detectar_fases() output for that
+        window (with its 'fase_asignada' column). Empty when detectar_tiros()
+        finds no window.
+    """
+    pairs = []
+    for window in detectar_tiros(df_angulos, prominencia_min_deg, separacion_min_ms):
+        sub = df_angulos.iloc[window.inicio:window.fin].reset_index(drop=True)
+        pairs.append((window, detectar_fases(sub)))
+    return pairs
+
+
 # --- Video processing -------------------------------------------------------
+
+
+# --- Shooter election -------------------------------------------------------
+# When several people share the frame, the pipeline must analyze the person
+# who is actually shooting instead of whichever pose MediaPipe ranked first.
+# The election below scores each candidate person by their whole-clip elbow
+# excursion (the shooter moves the elbow far more than a bystander) behind a
+# detection-quality gate (a garbage pose must never win on noise).
+#
+# HONESTY STATUS, READ BEFORE TRUSTING: this election is UNVALIDATED on real
+# footage. There is no real two-person video yet, so everything below is
+# proven only on synthetic landmark series. Worse, it ASSUMES MediaPipe keeps
+# person indices stable across frames: if the tracker swaps person 0 and
+# person 1 mid-clip, a "person series" silently mixes two different people
+# and its excursion is meaningless. No swap guard is implemented, because
+# without real two-person footage any hip-jump threshold would be a pure
+# guess that could falsely reject good videos; the election report exists so
+# a human can spot a wrong election instead. Deliberately no automatic
+# swap detection: document the risk, do not pretend it is handled.
+
+
+@dataclass(frozen=True)
+class ShooterCandidate:
+    """One person assessed for the shooter election, plus the verdict.
+
+    person_index is the MediaPipe pose slot (0-based). n_frames is the clip
+    length in frames and n_valid the frames where this person had a pose, so
+    valid_fraction is n_valid / n_frames. mean_visibility is the mean required
+    landmark visibility over the valid frames on the person's better side.
+    excursion_deg is the robust whole-clip elbow excursion in degrees (NaN
+    when unmeasurable). accepted tells whether the person cleared every gate,
+    and reason is the human-readable why, naming the failed gate and its
+    threshold for REJECTED candidates.
+    """
+
+    person_index: int
+    n_frames: int
+    n_valid: int
+    valid_fraction: float
+    mean_visibility: float
+    excursion_deg: float
+    accepted: bool
+    reason: str
+
+
+def robust_excursion_deg(values):
+    """Robust whole-signal excursion in degrees: p95 minus p5.
+
+    A raw max-minus-min range is the wrong metric here because ONE glitched
+    frame (a tracking jump, an occluded elbow guessed across the body) sets
+    both the max and the min at once, so the glitchiest person always wins.
+    The p95-p5 percentile range ignores a few extreme frames and measures the
+    motion the person actually sustains, which is what distinguishes a shot
+    (tens of degrees held across the dip-then-extend cycle) from noise.
+
+    Args:
+        values: iterable of floats in degrees (NaN entries are excluded:
+            frames with no detection carry no angle information and must not
+            pull the percentiles toward zero or toward a glitch).
+
+    Returns:
+        p95 minus p5 over the finite values, or NaN when there is nothing to
+        measure (no finite values, or a single repeated value giving 0.0,
+        which the excursion gate then rejects as no shot-like motion).
+    """
+    arr = np.asarray(list(values), dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return float("nan")
+    return float(np.percentile(arr, 95) - np.percentile(arr, 5))
+
+
+def elbow_signal_deg(person_frames, side, width, height):
+    """Per-frame elbow angle in degrees for ONE person's frame series.
+
+    Args:
+        person_frames: one person's series across the whole clip: per frame
+            either a landmark list or None (missing that frame). A missing
+            person in a frame yields NaN there and NEVER shifts the series.
+        side: "left" or "right", selecting the SIDE_JOINTS triplet.
+        width, height: frame size in pixels for to_pixel (angles are computed
+            in pixel space, never on normalized coordinates).
+
+    Returns:
+        A list of floats, one per frame: the elbow angle in degrees, or NaN
+        where the person was missing or the geometry was degenerate.
+    """
+    parts = SIDE_JOINTS[side]
+    signal = []
+    for entry in person_frames:
+        if entry is None:
+            signal.append(float("nan"))
+            continue
+        try:
+            s_px = to_pixel(entry[parts["shoulder"].value], width, height)
+            e_px = to_pixel(entry[parts["elbow"].value], width, height)
+            w_px = to_pixel(entry[parts["wrist"].value], width, height)
+            signal.append(calcular_angulo(s_px, e_px, w_px))
+        except (ValueError, IndexError, AttributeError, TypeError):
+            signal.append(float("nan"))
+    return signal
+
+
+def mean_required_visibility(person_frames, side):
+    """Mean visibility of the 6 required landmarks on one side, valid frames.
+
+    Args:
+        person_frames: one person's series (landmark list or None per frame).
+        side: "left" or "right", selecting the SIDE_JOINTS landmarks.
+
+    Returns:
+        The mean visibility over the required parts and the valid frames, or
+        NaN when the person has no valid frame.
+    """
+    parts = SIDE_JOINTS[side]
+    total = 0.0
+    count = 0
+    for entry in person_frames:
+        if entry is None:
+            continue
+        try:
+            for part in REQUIRED_PARTS:
+                total += float(entry[parts[part].value].visibility)
+                count += 1
+        except (IndexError, AttributeError, TypeError):
+            continue
+    if count == 0:
+        return float("nan")
+    return total / count
+
+
+def split_person_series(frames_poses):
+    """Transpose per-frame pose lists into per-person frame series.
+
+    Args:
+        frames_poses: per frame, the list of detected poses for that frame
+            (each pose a landmark list); an empty list means nobody was
+            detected in that frame.
+
+    Returns:
+        A list with one entry per detected person slot (the maximum pose
+        count over all frames): entry p is that person's landmark list per
+        frame, or None where the person was absent from the frame. Absence
+        is ALWAYS None, never a shift, so series never mix people within a
+        stable index assignment. An empty input yields an empty list.
+    """
+    n_persons = 0
+    for poses in frames_poses:
+        n_persons = max(n_persons, len(poses))
+    series = []
+    for p in range(n_persons):
+        series.append([poses[p] if p < len(poses) else None for poses in frames_poses])
+    return series
+
+
+def assess_shooter_candidates(person_series, width, height):
+    """Score every candidate person behind the detection-quality gate.
+
+    UNVALIDATED on real footage and assuming stable MediaPipe person indices
+    (see the section note above): on synthetic landmark series only. Both the
+    excursion and the visibility take each person's BETTER side, so a
+    left-handed shooter is not penalized and the occluded side of a lateral
+    view does not drag the scores down.
+
+    Gates apply BEFORE any ranking, in this order, so a rejected candidate's
+    excursion can never influence the outcome: no valid frames, then valid
+    fraction below MIN_SHOOTER_VALID_FRACTION, then mean visibility below
+    MIN_SHOOTER_VISIBILITY, then excursion below MIN_SHOOTER_EXCURSION_DEG
+    (or unmeasurable). Survivors are ACCEPTED with their excursion as score.
+
+    Args:
+        person_series: per-person frame series as returned by
+            split_person_series.
+        width, height: frame size in pixels for the elbow signals.
+
+    Returns:
+        A list of ShooterCandidate in person-index order (empty when nobody
+        was ever detected). Never raises on bad input: an empty series list
+        yields an empty candidate list.
+    """
+    candidates = []
+    n_frames = len(person_series[0]) if person_series else 0
+    for p, frames in enumerate(person_series):
+        n_valid = sum(1 for entry in frames if entry is not None)
+        valid_fraction = (n_valid / n_frames) if n_frames else 0.0
+        excursions = {}
+        visibilities = {}
+        for side in ("left", "right"):
+            excursions[side] = robust_excursion_deg(
+                elbow_signal_deg(frames, side, width, height)
+            )
+            visibilities[side] = mean_required_visibility(frames, side)
+        best_side = "left"
+        if excursions["right"] == excursions["right"] and (
+            not excursions["left"] == excursions["left"]
+            or excursions["right"] > excursions["left"]
+        ):
+            best_side = "right"
+        excursion = excursions[best_side]
+        visibility = max(
+            (v for v in visibilities.values() if v == v),
+            default=float("nan"),
+        )
+        if n_valid == 0:
+            candidates.append(ShooterCandidate(
+                person_index=p, n_frames=n_frames, n_valid=0,
+                valid_fraction=0.0, mean_visibility=float("nan"),
+                excursion_deg=float("nan"), accepted=False,
+                reason="no valid pose in any frame",
+            ))
+        elif valid_fraction < MIN_SHOOTER_VALID_FRACTION:
+            candidates.append(ShooterCandidate(
+                person_index=p, n_frames=n_frames, n_valid=n_valid,
+                valid_fraction=valid_fraction, mean_visibility=visibility,
+                excursion_deg=excursion, accepted=False,
+                reason="valid fraction %.2f below minimum %.2f"
+                % (valid_fraction, MIN_SHOOTER_VALID_FRACTION),
+            ))
+        elif not visibility == visibility or visibility < MIN_SHOOTER_VISIBILITY:
+            candidates.append(ShooterCandidate(
+                person_index=p, n_frames=n_frames, n_valid=n_valid,
+                valid_fraction=valid_fraction, mean_visibility=visibility,
+                excursion_deg=excursion, accepted=False,
+                reason="mean visibility %.3f below minimum %.2f"
+                % (visibility, MIN_SHOOTER_VISIBILITY),
+            ))
+        elif not excursion == excursion or excursion < MIN_SHOOTER_EXCURSION_DEG:
+            candidates.append(ShooterCandidate(
+                person_index=p, n_frames=n_frames, n_valid=n_valid,
+                valid_fraction=valid_fraction, mean_visibility=visibility,
+                excursion_deg=excursion, accepted=False,
+                reason="excursion %.1f deg below minimum %.1f deg: "
+                "no shot-like motion" % (excursion, MIN_SHOOTER_EXCURSION_DEG),
+            ))
+        else:
+            candidates.append(ShooterCandidate(
+                person_index=p, n_frames=n_frames, n_valid=n_valid,
+                valid_fraction=valid_fraction, mean_visibility=visibility,
+                excursion_deg=excursion, accepted=True,
+                reason="cleared all gates (best side '%s')" % best_side,
+            ))
+    return candidates
+
+
+def select_shooter(candidates):
+    """Pick the shooter as the ACCEPTED candidate with largest excursion.
+
+    Only ACCEPTED candidates are ranked: anyone the gate rejected is already
+    out and cannot win, however large its raw range. This is UNVALIDATED on
+    real footage (see the section note above).
+
+    Args:
+        candidates: list of ShooterCandidate from
+            assess_shooter_candidates.
+
+    Returns:
+        The winning person_index, or None when nobody was accepted. None is
+        the honest "the video may contain no shot" answer: the caller must
+        report it as such and must NOT silently analyze a rejected person as
+        if it were the shooter.
+    """
+    best = None
+    for cand in candidates:
+        if not cand.accepted:
+            continue
+        if best is None or cand.excursion_deg > best.excursion_deg:
+            best = cand
+    return best.person_index if best is not None else None
+
+
+def print_election_report(candidates, winner_index, side):
+    """Print the shooter election, one auditable line per candidate.
+
+    This report is the user's audit tool: a correct election and a wrong one
+    must be tellable apart from these lines alone, because this project has
+    been burned three times by confident output with no way to check it.
+
+    Args:
+        candidates: list of ShooterCandidate from
+            assess_shooter_candidates.
+        winner_index: person_index from select_shooter, or None for no shot.
+        side: the side argument ("auto", "left", "right"); an explicit
+            override is reported here because it bypasses auto-selection.
+    """
+    print(
+        "Shooter election (%d candidate%s; UNVALIDATED on real footage, "
+        "assumes stable person indices):"
+        % (len(candidates), "" if len(candidates) == 1 else "s")
+    )
+    for cand in candidates:
+        verdict = "ACCEPTED" if cand.accepted else "REJECTED"
+        print(
+            "  person %d: %d/%d valid frames (fraction %.2f), mean "
+            "visibility %.3f, excursion %.1f deg -> %s (%s)."
+            % (
+                cand.person_index, cand.n_valid, cand.n_frames,
+                cand.valid_fraction, cand.mean_visibility,
+                cand.excursion_deg, verdict, cand.reason,
+            )
+        )
+    if winner_index is None:
+        print(
+            "No shooter elected: no candidate cleared the quality and "
+            "excursion gates, so the video may contain no shot at all. No "
+            "rejected person is analyzed as the shooter."
+        )
+    else:
+        accepted = [c for c in candidates if c.accepted]
+        print(
+            "Selected shooter: person %d (largest excursion %.1f deg among "
+            "%d accepted candidate%s)."
+            % (
+                winner_index,
+                next(c.excursion_deg for c in accepted
+                     if c.person_index == winner_index),
+                len(accepted), "" if len(accepted) == 1 else "s",
+            )
+        )
+    if side in ("left", "right"):
+        print(
+            "Side '%s' is a CLI override: auto-selection is bypassed and "
+            "applies to the selected person." % side
+        )
 
 
 def _select_side(frames_landmarks, side):
@@ -430,6 +1034,12 @@ def _select_side(frames_landmarks, side):
     In a lateral (sagittal) view MediaPipe's LEFT/RIGHT labels are anatomical,
     not image-relative, so the side facing the camera is the one whose 6
     required landmarks are seen more confidently on average.
+
+    SCOPING CONTRACT: frames_landmarks must be ONE person's frame series
+    (landmark list or None per frame), never entries from different people
+    mixed together. Averaging visibility across people would let a bystander
+    with a visible opposite side flip the shooter's side, so callers elect
+    the shooter first and pass only the winner's series here.
     """
     if side in ("left", "right"):
         print("Using side '%s' (CLI override)." % side)
@@ -457,49 +1067,85 @@ def _select_side(frames_landmarks, side):
     return chosen
 
 
-def procesar_video(ruta_video, ruta_csv="angulos_tiro.csv", ruta_plot="perfil_angular.png",
-                   side="auto", model_path=DEFAULT_MODEL_PATH):
-    """Run the full pipeline on a pre-recorded video.
+def _pose_landmarker_options(model_path):
+    """Shared PoseLandmarker options: VIDEO mode, up to MAX_DETECTED_POSES."""
+    return vision.PoseLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=model_path),
+        running_mode=vision.RunningMode.VIDEO,
+        num_poses=MAX_DETECTED_POSES,
+        min_pose_detection_confidence=0.5,
+        min_pose_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
 
-    Reads frames, runs pose inference, extracts sagittal-plane angles on the
-    dominant side, segments phases, writes the CSV and the plot, and prints a
-    console summary. Exits non-zero if the video cannot be opened.
+
+def analizar_frames_con_cache(frames_iter, fps, width, height, side="auto",
+                              model_path=DEFAULT_MODEL_PATH):
+    """Run pose inference over any BGR frame iterator and return angles + cache.
+
+    This is the shared in-RAM core used by both the file CLI path and the
+    upload API path. The MediaPipe call, the timestamp monotonicity fix, the
+    shooter election (with its most-valid-frames fallback), the side selection
+    and the angle math are byte-for-byte the logic that used to live inline in
+    procesar_video: this function is a pure extraction, not a rewrite, so the
+    existing regression tests pin its behavior.
+
+    WHY an iterator instead of a video path: cv2.VideoCapture only accepts a
+    file path, so an upload that must never touch disk cannot be decoded with
+    OpenCV at all. The API decodes with ffmpeg piped from RAM (see
+    packages/api/app.py) and streams BGR frames frame by frame through this
+    iterator, so the whole decoded clip is never buffered as raw pixels (a
+    10 s 1080p clip is gigabytes of raw BGR).
+
+    Args:
+        frames_iter: iterable yielding BGR frames as uint8 numpy arrays with
+            shape (height, width, 3), one per video frame in time order.
+        fps: frames per second used for MediaPipe timestamps and the
+            'timestamp' column. Non-finite values and values <= 0 fall back
+            to 30.0 with a WARNING, mirroring procesar_video.
+        width: frame width in pixels for to_pixel (angles use pixel space).
+        height: frame height in pixels for to_pixel.
+        side: "auto" picks the side with higher mean landmark visibility,
+            "left"/"right" bypass auto-selection (CLI override).
+        model_path: path to the pose_landmarker .task model file.
+
+    Returns:
+        A (df_fases, info) tuple. df_fases is the phase-segmented angle
+        DataFrame with the exact CSV columns (frame, timestamp, three angles,
+        fase_asignada). info is a dict with the overlay cache and summary
+        stats: cached_points (per-frame pixel landmark lists or None for the
+        elected shooter), chosen (the side used), phases (list of phase
+        labels), boundaries (frame indices where the phase changes),
+        elbow_vals/knee_vals/shoulder_vals (float numpy arrays), total,
+        n_ok, n_missing, missing_pct, fps, width, height, winner.
     """
     import cv2
 
-    cap = cv2.VideoCapture(ruta_video)
-    if not cap.isOpened():
-        print("ERROR: cannot open video '%s'." % ruta_video, file=sys.stderr)
-        sys.exit(1)
-
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps is None or not math.isfinite(fps) or fps <= 0:
+    # WHY re-validate fps here instead of trusting the caller: both callers
+    # (file CLI via capture properties, upload API via ffprobe) can hand us a
+    # NaN/zero rate, and dividing by it would silently shift every timestamp.
+    try:
+        use_fps = float(fps)
+    except (TypeError, ValueError):
+        use_fps = float("nan")
+    if use_fps is None or not math.isfinite(use_fps) or use_fps <= 0:
         print(
             "WARNING: unreadable fps (got %r); falling back to 30 fps for "
             "timestamps." % (fps,),
             file=sys.stderr,
         )
-        fps = 30.0
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        use_fps = 30.0
+    fps = use_fps
 
-    options = vision.PoseLandmarkerOptions(
-        base_options=BaseOptions(model_asset_path=model_path),
-        running_mode=vision.RunningMode.VIDEO,
-        num_poses=1,
-        min_pose_detection_confidence=0.5,
-        min_pose_presence_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
+    options = _pose_landmarker_options(model_path)
     landmarker = vision.PoseLandmarker.create_from_options(options)
 
-    frames_landmarks = []
+    frames_poses = []
     frame_index = 0
     prev_timestamp_ms = None
     try:
-        while True:
-            ok, frame = cap.read()
-            if not ok or frame is None:
+        for frame in frames_iter:
+            if frame is None:
                 break
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
@@ -511,15 +1157,38 @@ def procesar_video(ruta_video, ruta_csv="angulos_tiro.csv", ruta_plot="perfil_an
             prev_timestamp_ms = timestamp_ms
             result = landmarker.detect_for_video(image, timestamp_ms)
             if result.pose_landmarks:
-                frames_landmarks.append(list(result.pose_landmarks[0]))
+                frames_poses.append(
+                    [list(pose) for pose in result.pose_landmarks[:MAX_DETECTED_POSES]]
+                )
             else:
-                frames_landmarks.append(None)
+                frames_poses.append([])
             frame_index += 1
     finally:
-        cap.release()
         landmarker.close()
 
-    total = len(frames_landmarks)
+    total = len(frames_poses)
+    person_series = split_person_series(frames_poses)
+    candidates = assess_shooter_candidates(person_series, width, height)
+    winner = select_shooter(candidates)
+    print_election_report(candidates, winner, side)
+    if winner is None:
+        if person_series:
+            fallback = max(
+                range(len(person_series)),
+                key=lambda p: sum(1 for entry in person_series[p] if entry is not None),
+            )
+            print(
+                "WARNING: no shooter elected; falling back to person %d "
+                "(most valid frames) for the angle output below. This "
+                "output is NOT a shot analysis, do not trust its phases."
+                % fallback,
+                file=sys.stderr,
+            )
+            frames_landmarks = person_series[fallback]
+        else:
+            frames_landmarks = [None] * total
+    else:
+        frames_landmarks = person_series[winner]
     n_ok = sum(1 for entry in frames_landmarks if entry is not None)
     n_missing = total - n_ok
     missing_pct = (100.0 * n_missing / total) if total else 0.0
@@ -553,6 +1222,117 @@ def procesar_video(ruta_video, ruta_csv="angulos_tiro.csv", ruta_plot="perfil_an
 
     df = pd.DataFrame(rows, columns=[COL_FRAME, COL_TIMESTAMP, COL_ELBOW, COL_KNEE, COL_SHOULDER])
     df_fases = detectar_fases(df)
+
+    # Overlay cache: pixel coordinates of the analyzed person plus the phase
+    # outputs, mirroring generar_video_feedback so the burned-in overlay and
+    # the CSV can never disagree. Cached (not re-inferred) on purpose.
+    cached_points = []
+    for entry in frames_landmarks:
+        if entry is None:
+            cached_points.append(None)
+        else:
+            cached_points.append([to_pixel(lm, width, height) for lm in entry])
+    phases = list(df_fases[COL_PHASE]) if len(df_fases) else []
+    boundaries = find_phase_boundaries(phases)
+    elbow_vals = pd.to_numeric(df_fases[COL_ELBOW], errors="coerce").to_numpy(dtype=float) if len(df_fases) else np.array([], dtype=float)
+    knee_vals = pd.to_numeric(df_fases[COL_KNEE], errors="coerce").to_numpy(dtype=float) if len(df_fases) else np.array([], dtype=float)
+    shoulder_vals = pd.to_numeric(df_fases[COL_SHOULDER], errors="coerce").to_numpy(dtype=float) if len(df_fases) else np.array([], dtype=float)
+    info = {
+        "cached_points": cached_points,
+        "chosen": chosen,
+        "phases": phases,
+        "boundaries": boundaries,
+        "elbow_vals": elbow_vals,
+        "knee_vals": knee_vals,
+        "shoulder_vals": shoulder_vals,
+        "total": total,
+        "n_ok": n_ok,
+        "n_missing": n_missing,
+        "missing_pct": missing_pct,
+        "fps": fps,
+        "width": width,
+        "height": height,
+        "winner": winner,
+    }
+    return df_fases, info
+
+
+def analizar_frames(frames_iter, fps, width, height, side="auto",
+                    model_path=DEFAULT_MODEL_PATH):
+    """Analyze any BGR frame iterator and return the phase DataFrame.
+
+    Thin wrapper over analizar_frames_con_cache for callers that only need
+    the angles/phases table (the CLI adapter path). See
+    analizar_frames_con_cache for the full contract.
+
+    Args:
+        frames_iter: iterable yielding BGR frames (uint8 HxWx3 arrays).
+        fps: frames per second (falls back to 30.0 when unreadable).
+        width: frame width in pixels.
+        height: frame height in pixels.
+        side: "auto", "left" or "right".
+        model_path: path to the pose_landmarker .task model file.
+
+    Returns:
+        The phase-segmented angle DataFrame (same contract as
+        procesar_video), with columns frame, timestamp, the three angle
+        columns and fase_asignada.
+    """
+    df_fases, _info = analizar_frames_con_cache(
+        frames_iter, fps, width, height, side=side, model_path=model_path
+    )
+    return df_fases
+
+
+def procesar_video(ruta_video, ruta_csv="angulos_tiro.csv", ruta_plot="perfil_angular.png",
+                   side="auto", model_path=DEFAULT_MODEL_PATH):
+    """Run the full pipeline on a pre-recorded video.
+
+    Reads frames, runs pose inference, extracts sagittal-plane angles on the
+    dominant side, segments phases, writes the CSV and the plot, and prints a
+    console summary. Exits non-zero if the video cannot be opened.
+    """
+    import cv2
+
+    cap = cv2.VideoCapture(ruta_video)
+    if not cap.isOpened():
+        print("ERROR: cannot open video '%s'." % ruta_video, file=sys.stderr)
+        sys.exit(1)
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps is None or not math.isfinite(fps) or fps <= 0:
+        print(
+            "WARNING: unreadable fps (got %r); falling back to 30 fps for "
+            "timestamps." % (fps,),
+            file=sys.stderr,
+        )
+        fps = 30.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    def _iter_capture():
+        """Yield BGR frames from the capture until exhaustion.
+
+        Args: none (reads from the enclosing capture).
+
+        Returns: nothing; yields one BGR frame per iteration.
+        """
+        while True:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
+            yield frame
+
+    try:
+        df_fases, info = analizar_frames_con_cache(
+            _iter_capture(), fps, width, height, side=side, model_path=model_path
+        )
+    finally:
+        cap.release()
+    total = info["total"]
+    n_ok = info["n_ok"]
+    n_missing = info["n_missing"]
+    missing_pct = info["missing_pct"]
     # pandas and matplotlib both raise if the parent directory is missing.
     for ruta in (ruta_csv, ruta_plot):
         parent = os.path.dirname(os.path.abspath(ruta))
@@ -927,18 +1707,12 @@ def generar_video_feedback(ruta_video, ruta_salida, side="auto",
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    options = vision.PoseLandmarkerOptions(
-        base_options=BaseOptions(model_asset_path=model_path),
-        running_mode=vision.RunningMode.VIDEO,
-        num_poses=1,
-        min_pose_detection_confidence=0.5,
-        min_pose_presence_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
+    options = _pose_landmarker_options(model_path)
     landmarker = vision.PoseLandmarker.create_from_options(options)
 
-    raw_landmarks = []  # landmark objects per frame (None when undetected)
-    cached_points = []  # pixel coords per frame (None when undetected)
+    # Per frame, the list of detected poses (each a landmark list); an empty
+    # list means nobody was detected in that frame.
+    frames_poses = []
     frame_index = 0
     prev_timestamp_ms = None
     try:
@@ -956,16 +1730,45 @@ def generar_video_feedback(ruta_video, ruta_salida, side="auto",
             prev_timestamp_ms = timestamp_ms
             result = landmarker.detect_for_video(image, timestamp_ms)
             if result.pose_landmarks:
-                entry = list(result.pose_landmarks[0])
-                raw_landmarks.append(entry)
-                cached_points.append([to_pixel(lm, width, height) for lm in entry])
+                frames_poses.append(
+                    [list(pose) for pose in result.pose_landmarks[:MAX_DETECTED_POSES]]
+                )
             else:
-                raw_landmarks.append(None)
-                cached_points.append(None)
+                frames_poses.append([])
             frame_index += 1
     finally:
         cap.release()
         landmarker.close()
+
+    # Same election as the CSV path, so overlay and CSV analyze the same
+    # person. The overlay draws the winner's skeleton from the cached pixel
+    # coordinates below.
+    person_series = split_person_series(frames_poses)
+    candidates = assess_shooter_candidates(person_series, width, height)
+    winner = select_shooter(candidates)
+    print_election_report(candidates, winner, side)
+    if winner is None:
+        if person_series:
+            fallback = max(
+                range(len(person_series)),
+                key=lambda p: sum(1 for entry in person_series[p] if entry is not None),
+            )
+            print(
+                "WARNING: no shooter elected; falling back to person %d "
+                "for the feedback overlay. This output is NOT a shot "
+                "analysis, do not trust its phases." % fallback,
+                file=sys.stderr,
+            )
+            winner = fallback
+        else:
+            winner = 0
+    raw_landmarks = person_series[winner] if person_series else [None] * len(frames_poses)
+    cached_points = []
+    for entry in raw_landmarks:
+        if entry is None:
+            cached_points.append(None)
+        else:
+            cached_points.append([to_pixel(lm, width, height) for lm in entry])
 
     total = len(raw_landmarks)
     if total == 0:
@@ -1060,8 +1863,21 @@ def main(argv=None):
         "shot video and segment the shot into phases."
     )
     parser.add_argument("video", help="Path to the pre-recorded video file.")
-    parser.add_argument("--csv", default="angulos_tiro.csv", help="Output CSV path.")
-    parser.add_argument("--plot", default="perfil_angular.png", help="Output plot path.")
+    parser.add_argument("--csv", default=None,
+                        help="Output CSV path (default: 'angulos_tiro.csv' in the "
+                             "current directory, or inside --salida-dir when given).")
+    parser.add_argument("--plot", default=None,
+                        help="Output plot path (default: 'perfil_angular.png' in the "
+                             "current directory, or inside --salida-dir when given).")
+    parser.add_argument("--salida-dir", default=None, metavar="DIR",
+                        help="Directory that collects every artifact of this run. "
+                             "Without it every run writes the same fixed filenames "
+                             "into the current directory, so analyzing a second "
+                             "shot OVERWRITES the first one, which destroys the "
+                             "reference you need to compare against. Use a distinct "
+                             "directory per analyzed shot. An explicit --csv, "
+                             "--plot or --video-feedback path is always respected "
+                             "verbatim and is never relocated into this directory.")
     parser.add_argument("--side", choices=("auto", "left", "right"), default="auto",
                         help="Dominant side; 'auto' picks the side with higher "
                         "mean landmark visibility.")
@@ -1076,10 +1892,28 @@ def main(argv=None):
                         "which works here; try avc1 on machines with an H.264 "
                         "encoder).")
     args = parser.parse_args(argv)
-    procesar_video(args.video, ruta_csv=args.csv, ruta_plot=args.plot,
+
+    # Resolve output paths. A path the caller spelled out is used verbatim; only
+    # the DEFAULTS are relocated, so passing --salida-dir can never silently
+    # move a file the user explicitly asked for somewhere else.
+    csv_path = args.csv
+    plot_path = args.plot
+    feedback_path = args.video_feedback
+    if args.salida_dir:
+        os.makedirs(args.salida_dir, exist_ok=True)
+        csv_path = csv_path or os.path.join(args.salida_dir, "angulos_tiro.csv")
+        plot_path = plot_path or os.path.join(args.salida_dir, "perfil_angular.png")
+        # The annotated video is NOT enabled by this directory: drawing it costs
+        # a second full inference pass, so asking for it stays an explicit choice.
+        if feedback_path and not os.path.dirname(feedback_path):
+            feedback_path = os.path.join(args.salida_dir, feedback_path)
+    csv_path = csv_path or "angulos_tiro.csv"
+    plot_path = plot_path or "perfil_angular.png"
+
+    procesar_video(args.video, ruta_csv=csv_path, ruta_plot=plot_path,
                    side=args.side, model_path=args.model)
-    if args.video_feedback:
-        generar_video_feedback(args.video, args.video_feedback,
+    if feedback_path:
+        generar_video_feedback(args.video, feedback_path,
                                side=args.side, model_path=args.model,
                                codec=args.codec)
 
